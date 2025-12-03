@@ -1,0 +1,11 @@
+[project]
+name = "1d-toy-model"
+version = "0.1.0"
+description = "Initial version of model, not to be used as does not represent problem accurately. Uploaded to show initial thought process and logic"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.10.7",
+    "numpy>=2.3.5",
+    "scipy>=1.16.3",
+]
