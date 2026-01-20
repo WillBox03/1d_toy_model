@@ -1,6 +1,6 @@
 [project]
 name = "1d-toy-model"
-version = "0.2.0"
+version = "0.2.1"
 description = "A simulation of 1-D proton beam scanning sequences on targets subject to breathing motion. This specifically calculates the dose distribution over the GTV and the mean squared error from the intended dose distribution."
 readme = "README.md"
 requires-python = ">=3.13"
