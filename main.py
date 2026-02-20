@@ -8,7 +8,7 @@ resolution = 0.01 # in cm
 
 ctv_length = 2 # in cm
 
-n_spots = 10
+n_spots = 8
 
 amp = 1 #in cm 
  
@@ -16,9 +16,9 @@ ctv = ITV_engine.ITV_env(resolution, ctv_length, n_spots, amp)
 
 ctv.set_spot_weights(np.ones(n_spots)) # Uniform weighting
 
-t_step = 0.1 # in s
+t_step = 0.2 # in s
 
-period = 5 # in s
+period = 7 # in s
 
 '''lr_rast_dist = ctv.sim(t_step, freq, 'lr_rast', 3/2*np.pi) # Left to right raster scan
 lr_rast_mse = ctv.calc_mse(lr_rast_dist)
@@ -37,11 +37,18 @@ print(lr_rast_mse)
 
 #max_time_dist = ctv.sim(t_step, period, 'max_dist,0)
 
-min_dist = ctv.sim(t_step, period, np.array([9, 4, 1, 6, 0, 8, 5, 7, 2, 3]), 0)
-min_dist_mse = ctv.calc_mse(min_dist)
-print(min_dist_mse)
-#print(lr_rast_avg_mse, rl_rast_avg_mse, rand_avg_mse)
+min_mse_dist = ctv.sim(t_step, period, np.array([6, 1, 4, 5, 0, 7, 2, 3]), 0)
+min_mse_dist_mse = ctv.calc_mse(min_mse_dist)
+print(f"Minimum distribution using mse as evaluation gives mse of {min_mse_dist_mse} ")
+min_mse_dist_wmse = ctv.calc_wmse(min_mse_dist)
+print(f"Minimum distribution using mse as evaluation gives wmse of {min_mse_dist_wmse} ")
 
-sims = np.array([min_dist])
+min_wmse_dist = ctv.sim(t_step, period, np.array([6, 1, 4, 5, 0, 7, 2, 3]), 0)
+min_wmse_dist_mse = ctv.calc_mse(min_wmse_dist)
+print(f"Minimum distribution using wmse as evaluation gives mse of {min_mse_dist_mse} ")
+min_wmse_dist_wmse = ctv.calc_wmse(min_wmse_dist)
+print(f"Minimum distribution using wmse as evaluation gives wmse of {min_wmse_dist_wmse} ")
+
+sims = np.array([min_mse_dist])
 
 ctv.display_sims(sims)

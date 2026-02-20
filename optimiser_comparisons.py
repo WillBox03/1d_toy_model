@@ -1,0 +1,117 @@
+import numpy as np
+from optimiser import SequenceOptimiser
+from ITV_engine import ITV_env
+import matplotlib.pyplot as plt
+import time
+import gc
+
+if __name__ == "__main__":
+
+    resolution = 0.01 # in cm
+
+    ctv_length = 2 # in cm
+
+    n_spots = 10
+
+    amp = 1 #in cm 
+
+    t_step = 0.1
+
+    period = 5
+
+    env = ITV_env(resolution, ctv_length, n_spots, amp)
+
+    env.set_spot_weights(np.ones(n_spots))
+
+    start_time = time.perf_counter()
+    env.calculate_mask_tensor(t_step, period)
+    end_time = time.perf_counter()
+    duration = end_time - start_time
+
+    print(f"Tensor mask loaded in {duration:.4f} seconds")
+    
+    opt = SequenceOptimiser(env)
+    
+    repeats = 10
+    
+    baseline_raster = env.evaluate_sequences(np.array([np.arange(n_spots)]), True)
+    sequence_ex, mse_ex = opt.run("exhaustive", weighting = True)
+    
+    times = 5
+    
+    mse_sa = np.zeros((times, repeats, 2))
+    mse_mc = np.zeros((times, repeats, 2))
+    mse_h  = np.zeros((times, repeats, 2))
+    
+    sa_params = np.array([1100,5600,12000,28000,58000])
+    mc_params = np.array([3500, 18000, 36000, 90000, 180000])
+    h_params = np.array([[250,4],[900,10],[900,20],[1500,35],[1500,70]])
+    
+    for j in range(times):
+        for i in range(repeats):
+        
+            gc.collect()
+            
+            opt = SequenceOptimiser(env)
+            
+            _, mse_sa[j,i,0], mse_sa[j,i,1] = opt.run('simanneal', iterations = sa_params[j], temp = 0.3, final_temp = 0.001, time_track = True)
+            
+            _, mse_mc[j,i,0] ,mse_mc[j,i,1] = opt.run("montecarlo",n_samples = mc_params[j], time_track = True)
+            
+            _, mse_h[j,i,0], mse_h[j,i,1] = opt.run("mcghybrid", n_samples = h_params[j,0], generations = h_params[j,1], time_track = True)
+            
+            time.sleep(0.5* (j + 1))
+
+    sa_means = np.mean(mse_sa, axis=1) # Shape: (5, 2)
+    sa_stds  = np.std(mse_sa, axis=1)
+
+    # Monte Carlo Stats
+    mc_means = np.mean(mse_mc, axis=1)
+    mc_stds  = np.std(mse_mc, axis=1)
+
+    # Hybrid Stats
+    h_means  = np.mean(mse_h, axis=1)
+    h_stds   = np.std(mse_h, axis=1)
+    
+    plt.figure(figsize=(10, 6))
+
+    # Plot SA (Blue)
+    plt.errorbar(
+        x=sa_means[:, 1],      # X = Average Time
+        y=sa_means[:, 0],      # Y = Average MSE
+        xerr=sa_stds[:, 1],    # Horizontal Error Bars (Time Variance)
+        yerr=sa_stds[:, 0],    # Vertical Error Bars (MSE Variance)
+        label='Simulated Annealing',
+        fmt='-o', capsize=5
+    )
+
+    # Plot MC (Orange)
+    plt.errorbar(
+        x=mc_means[:, 1], 
+        y=mc_means[:, 0], 
+        xerr=mc_stds[:, 1], 
+        yerr=mc_stds[:, 0], 
+        label='Monte Carlo',
+        fmt='-s', capsize=5
+    )
+
+    # Plot Hybrid (Green)
+    plt.errorbar(
+        x=h_means[:, 1], 
+        y=h_means[:, 0], 
+        xerr=h_stds[:, 1], 
+        yerr=h_stds[:, 0], 
+        label='Hybrid',
+        fmt='-^', capsize=5
+    )
+    
+    plt.axhline(y=baseline_raster, color='red', linestyle='--', linewidth=2, label='Baseline (Raster)')
+    plt.axhline(y=mse_ex, color='green', linestyle='--', linewidth=2, label='Optimal (Exhaustive)')
+    
+    plt.title('Time-Accuracy Trade-off')
+    plt.xlabel('Execution Time (s)')
+    plt.ylabel('MSE')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.show()
+    

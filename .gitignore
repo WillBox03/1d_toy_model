@@ -13,3 +13,4 @@ wheels/
 # Scripts
 parameter_analysis.py
 main.py
+sim_anneal_optimise.py

@@ -169,6 +169,27 @@ class ITV_env:
             
         return self.mse
     
+    def calc_wmse(self, dose_dist):
+        
+        '''
+        Calculates the weighted mean squared error (WMSE) of a resultant dose distribution,
+        weighing negative errors higher than positive ones
+        '''
+        
+        _intended_dist = self.get_intended_dist()
+        
+        _diffs = dose_dist - _intended_dist
+        
+        _sq_diffs = _diffs**2
+        
+        #Multiply negative square diffs by 5
+        _sq_diffs[_diffs<0] *= 5
+        
+        self.wmse = np.mean(_sq_diffs)
+        
+        return self.wmse
+        
+    
     
     def calculate_mask_tensor(self, t_step, period, starting_phase = None):
         """
@@ -221,12 +242,13 @@ class ITV_env:
 
         return self.tensor
     
-    def evaluate_sequences(self, sequences):
+    def evaluate_sequences(self, sequences, weighting = False):
         
         """
         Calculates MSE for a batch of sequences.
         Args:
             sequences: Array of sample sequences
+            weighting(bool): Determines whether weighted mse or regular mse is used for evaluation
         """
         
         n_sequences = sequences.shape[0]
@@ -238,7 +260,7 @@ class ITV_env:
         times[:,1:] = np.cumsum(jumps, axis=1)
         
         #Generate empty array for all mses
-        mses = np.zeros(n_sequences)
+        evals = np.zeros(n_sequences)
         
         #Loop through each sequence
         for sequence in range(n_sequences):
@@ -247,13 +269,18 @@ class ITV_env:
             dists = self.tensor[:, sequences[sequence], times[sequence], :].sum(axis=1)
             
             # Find the squared differences between the distributions and intended across all phases
-            # Still evaluates using MSE
-            sq_diffs = (dists - intended)**2
+            # Evaluates using WMSE
+            diffs = dists - intended
+            
+            sq_diffs = diffs**2
+            
+            if weighting:
+                sq_diffs[diffs<0] *= 5
             
             # Average across voxels and required phases
-            mses[sequence] = np.mean(sq_diffs)
+            evals[sequence] = np.mean(sq_diffs)
         
-        return mses
+        return evals
     
     def display_sims(self, sims):
         
