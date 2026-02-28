@@ -8,7 +8,7 @@ if __name__ == "__main__":
 
     resolution = 0.01 # in cm
 
-    ctv_length = 2 # in cm
+    env_length = 2 # in cm
 
     n_spots = 10
 
@@ -17,7 +17,7 @@ if __name__ == "__main__":
     t_step = np.linspace(0.01, 2, 50) # in seconds
     period = np.linspace(0.01, 2, 50) # in hertz
 
-    env = ITV_env(resolution, ctv_length, n_spots, amp)
+    env = ITV_env(resolution, env_length, n_spots, amp)
 
     env.set_spot_weights(np.ones(n_spots))
     
@@ -43,7 +43,7 @@ if __name__ == "__main__":
             for k in range(repeats):
                 gc.collect()
                 opt = SequenceOptimiser(env)
-                _, _, improvement_times[i,j,k], _ = opt.run("mcghybrid", n_samples = 1000, generations = 50, time_track = True, comparison_sequence = raster, time_to_beat = True)
+                _, _, improvement_times[i,j,k], _ = opt.run("mcghybrid", n_samples = 1000, generations = 50, time_track = True, comparison_sequence = raster, target_improvement = True)
 
     avg_improvement_times = np.mean(improvement_times, axis=2)
     

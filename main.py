@@ -1,54 +1,78 @@
-import ITV_engine
 import numpy as np
 import sys
+import time
+
+from ITV_engine import ITV_env
+from optimiser import SequenceOptimiser
 
 np.set_printoptions(threshold=sys.maxsize)
 
 resolution = 0.01 # in cm
 
-ctv_length = 2 # in cm
+env_length = 2 # in cm
 
-n_spots = 8
+n_spots = 10
 
-amp = 1 #in cm 
- 
-ctv = ITV_engine.ITV_env(resolution, ctv_length, n_spots, amp)
+amp = 1 #in cm #
 
-ctv.set_spot_weights(np.ones(n_spots)) # Uniform weighting
+env = ITV_env(resolution, env_length, n_spots, amp)
 
-t_step = 0.2 # in s
+env.set_spot_weights('uniform', repaints = 0) # Uniform weighting
 
-period = 7 # in s
+t_step = 1/9 # in s
 
-'''lr_rast_dist = ctv.sim(t_step, freq, 'lr_rast', 3/2*np.pi) # Left to right raster scan
-lr_rast_mse = ctv.calc_mse(lr_rast_dist)
-print(lr_rast_mse)
+period = 2 # in s
 
-rl_rast_dist = ctv.sim(t_step, freq, 'rl_rast', 3/2*np.pi) # Right to left raster scan
-rl_rast_mse = ctv.calc_mse(rl_rast_dist)
-print(lr_rast_mse)
+starting_phase = 0 # in rads
+
+lr_rast_dist, lr_rast_wmse = env.sim(t_step, period, 'lr_rast', starting_phase= starting_phase) 
+
+# Right to left raster scan
+rl_rast_dist, rl_rast_wmse = env.sim(t_step, period, 'rl_rast', starting_phase= starting_phase) 
+
+# By leaving starting_phase as None , it automatically simulates all 8 phases.
 
 # When averaging over all phases, lr and rl raster scans should be identical
-#lr_rast_dists, lr_rast_avg_mse = ctv.sim_phases(t_step, freq, 'lr_rast')
-#rl_rast_dists, rl_rast_avg_mse = ctv.sim_phases(t_step, freq, 'rl_rast')
+lr_rast_dists, lr_rast_avg_wmse = env.sim(t_step, period, 'lr_rast')
+rl_rast_dists, rl_rast_avg_wmse = env.sim(t_step, period, 'rl_rast')
 
-#rand_dist = ctv.sim(t_step, freq, 'rand', 0)
-#rand_dists, rand_avg_mse = ctv.sim_phases(t_step, freq, 'rand') # Random sequence scan'''
+# Max distances
+max_time_dist, max_time_wmse = env.sim(t_step, period, 'max_dist', starting_phase= starting_phase)
+max_dists, max_avg_wmse = env.sim(t_step, period, 'max_dist')
 
-#max_time_dist = ctv.sim(t_step, period, 'max_dist,0)
+# Random sequences requires saving of the random sequence to be reused
+random_sequence = env.set_sequence('rand')
+print(f"The random sequence is: {random_sequence}")
 
-min_mse_dist = ctv.sim(t_step, period, np.array([6, 1, 4, 5, 0, 7, 2, 3]), 0)
-min_mse_dist_mse = ctv.calc_mse(min_mse_dist)
-print(f"Minimum distribution using mse as evaluation gives mse of {min_mse_dist_mse} ")
-min_mse_dist_wmse = ctv.calc_wmse(min_mse_dist)
-print(f"Minimum distribution using mse as evaluation gives wmse of {min_mse_dist_wmse} ")
+# Pass in as an explicitly saved array into the sim model
+rand_dist, rand_wmse = env.sim(t_step, period, random_sequence, starting_phase= starting_phase)
+rand_dists, rand_avg_wmse = env.sim(t_step, period, random_sequence)
 
-min_wmse_dist = ctv.sim(t_step, period, np.array([6, 1, 4, 5, 0, 7, 2, 3]), 0)
-min_wmse_dist_mse = ctv.calc_mse(min_wmse_dist)
-print(f"Minimum distribution using wmse as evaluation gives mse of {min_mse_dist_mse} ")
-min_wmse_dist_wmse = ctv.calc_wmse(min_wmse_dist)
-print(f"Minimum distribution using wmse as evaluation gives wmse of {min_wmse_dist_wmse} ")
+# Find the optimal sequence
+start_time = time.perf_counter()
+env.calculate_mask_tensor(t_step, period, starting_phase = starting_phase)
+end_time = time.perf_counter()
+duration = end_time - start_time
+print(f"Tensor mask loaded in {duration:.4f} seconds")
 
-sims = np.array([min_mse_dist])
+optimiser = SequenceOptimiser(env)
 
-ctv.display_sims(sims)
+optimal_sequence, optimal_wmse_optimiser = optimiser.run('exhaustive')
+optimal_dist, _ = env.sim(t_step, period, optimal_sequence, starting_phase=0.0)
+print(f'Optimal sequence (exhaustive search) is {optimal_sequence}')
+
+sims = [lr_rast_dist, rl_rast_dist, optimal_dist]
+names = ['Left-to-Right Raster', 'Right-to-Left Raster', 'Optimal Sequence']
+
+print(f"""wmses for a starting phase of 0 are:
+      {names[0]}:{lr_rast_wmse}
+      {names[1]}:{rl_rast_wmse}
+      {names[2]}:{optimal_wmse_optimiser}""")
+
+'''print(f"""Average wmses for all starting phases:
+      {names[0]}:{lr_rast_avg_wmse}
+      {names[1]}:{rl_rast_avg_wmse}
+      """)'''
+
+# Display
+env.display_sims(sims, names)

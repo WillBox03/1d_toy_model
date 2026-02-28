@@ -9,7 +9,7 @@ if __name__ == "__main__":
 
     resolution = 0.01 # in cm
 
-    ctv_length = 2 # in cm
+    env_length = 2 # in cm
 
     n_spots = 10
 
@@ -19,9 +19,9 @@ if __name__ == "__main__":
 
     period = 5
 
-    env = ITV_env(resolution, ctv_length, n_spots, amp)
+    env = ITV_env(resolution, env_length, n_spots, amp)
 
-    env.set_spot_weights(np.ones(n_spots))
+    env.set_spot_weights('uniform', repaints = 3)
 
     start_time = time.perf_counter()
     env.calculate_mask_tensor(t_step, period)
@@ -32,10 +32,10 @@ if __name__ == "__main__":
     
     opt = SequenceOptimiser(env)
     
-    repeats = 10
+    repeats = 5
     
     baseline_raster = env.evaluate_sequences(np.array([np.arange(n_spots)]), True)
-    sequence_ex, mse_ex = opt.run("exhaustive", weighting = True)
+    #sequence_ex, mse_ex = opt.run("exhaustive", weighting = True)
     
     times = 5
     
@@ -58,7 +58,7 @@ if __name__ == "__main__":
             
             _, mse_mc[j,i,0] ,mse_mc[j,i,1] = opt.run("montecarlo",n_samples = mc_params[j], time_track = True)
             
-            _, mse_h[j,i,0], mse_h[j,i,1] = opt.run("mcghybrid", n_samples = h_params[j,0], generations = h_params[j,1], time_track = True)
+            _, mse_h[j,i,0], mse_h[j,i,1], _ = opt.run("mcghybrid", n_samples = h_params[j,0], generations = h_params[j,1])
             
             time.sleep(0.5* (j + 1))
 
@@ -106,7 +106,7 @@ if __name__ == "__main__":
     )
     
     plt.axhline(y=baseline_raster, color='red', linestyle='--', linewidth=2, label='Baseline (Raster)')
-    plt.axhline(y=mse_ex, color='green', linestyle='--', linewidth=2, label='Optimal (Exhaustive)')
+    #plt.axhline(y=mse_ex, color='green', linestyle='--', linewidth=2, label='Optimal (Exhaustive)')
     
     plt.title('Time-Accuracy Trade-off')
     plt.xlabel('Execution Time (s)')

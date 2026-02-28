@@ -12,7 +12,24 @@ class SequenceOptimiser:
     
     def __init__(self, env):
         self.env = env
-        self.n_spots = env.n_spots
+        
+        # Checks for mask tensor in in environment engine
+        if not hasattr(self.env, 'tensor'):
+            raise RuntimeError(
+                "Environment Error: Mask Tensor not found. "
+                "You must call 'env.calculate_mask_tensor()' before initialising the optimiser."
+            )
+        
+        # Check that spot weights have been set
+        if not hasattr(self.env, 'spots_expanded'):
+            raise RuntimeError(
+                "Environment Error: Spot weights not set."
+                "You must call 'env.set_spot_weights()' before initialising the optimiser."
+            )
+        
+        self.base_sequence = self.env.spots_expanded
+        self.seq_len = len(self.base_sequence)
+        
         self.rng = np.random.default_rng()
         
     def run(self, method, **kwargs):
@@ -26,7 +43,7 @@ class SequenceOptimiser:
         elif method == 'exhaustive':
             return self.exhaustive(**kwargs)
         elif method == 'greedygd':
-            return self.greedy_gd(*kwargs)
+            return self.greedy_gd(**kwargs)
         elif method == 'simanneal':
             return self.simulated_annealing(**kwargs)
         elif method == 'mcghybrid':
@@ -38,7 +55,9 @@ class SequenceOptimiser:
         '''
         Generates random sequences and evaluates each one
         '''
-        sequences = self.rng.permuted(np.tile(np.arange(self.n_spots), (n_samples, 1)), axis=1)
+        sequences = np.tile(self.base_sequence, (n_samples, 1))
+        sequences = self.rng.permuted(sequences, axis = 1)
+        
         evals = self.env.evaluate_sequences(sequences, weighting)
         return sequences, evals
         
@@ -80,18 +99,21 @@ class SequenceOptimiser:
             return sequences[best_idx], evals[best_idx], duration
     
     def exhaustive(self, weighting=True):
+        if self.seq_len > 11:
+            raise MemoryError(f"Sequence length is {self.seq_len}. Exhaustive search requires {factorial(self.seq_len)} permutations, which will take a significant amount of time and may causes crashes. Please use a heuristic method instead.")
+        
         print("Running Exhaustive Search")
         start_time = time.perf_counter()
 
         # Efficient permutation generation (Steinhaus-Johnson-Trotter logic)
-        total_perms = factorial(self.n_spots)
-        sequences = np.zeros((total_perms, self.n_spots), np.int16)
+        total_perms = factorial(self.seq_len)
+        sequences = np.zeros((total_perms, self.seq_len), np.int16)
         fact = 1
-        for m in range(2, self.n_spots + 1):
-            frame = sequences[:fact, self.n_spots - m + 1:]
+        for m in range(2, self.seq_len + 1):
+            frame = sequences[:fact, self.seq_len - m + 1:]
             for i in range(1, m):
-                sequences[i * fact : (i + 1) * fact, self.n_spots - m] = i
-                sequences[i * fact : (i + 1) * fact, self.n_spots - m + 1:] = frame + (frame >= i)
+                sequences[i * fact : (i + 1) * fact, self.seq_len - m] = i
+                sequences[i * fact : (i + 1) * fact, self.seq_len - m + 1:] = frame + (frame >= i)
             frame += 1
             fact *= m
         
@@ -134,7 +156,7 @@ class SequenceOptimiser:
         start_time = time.perf_counter()
         
         # Initialize
-        current_seq = np.arange(self.n_spots)
+        current_seq = self.base_sequence.copy()
         self.rng.shuffle(current_seq)
         current_mse = self.env.evaluate_sequences(current_seq[np.newaxis, :], weighting)[0]
         
@@ -202,10 +224,27 @@ class SequenceOptimiser:
         else:
             return best_seq, best_mse, duration
     
-    def mc_greedy_hybrid(self, n_samples=1000, generations=10, population_size = 10, weighting=True, time_track = False, comparison_sequence = None, time_to_beat = False):
+    def mc_greedy_hybrid(self, n_samples=1000, generations=10, population_size = 10, weighting=True, comparison_sequence = None, target_improvement=None):
+        
         print("Running Monte Carlo Greedy Hybrid")
         start_time = time.perf_counter()
-
+        
+        comparison_mse = None
+        if comparison_sequence is not None:
+            comparison_mse = self.env.evaluate_sequences(comparison_sequence[np.newaxis, :], weighting)[0]
+            print(f"Baseline comparison MSE: {comparison_mse:.6f}")
+                     
+        # Check for early comparison improvement exit conditions               
+        def check_target(current_mse):
+            if current_mse == 0.0:
+                return (comparison_mse - current_mse) / comparison_mse if comparison_mse else 0.0
+                
+            if comparison_mse is not None and target_improvement is not None:
+                imp = (comparison_mse - current_mse) / comparison_mse
+                if imp >= target_improvement:
+                    return imp
+            return False
+        
         # Get initial best sequences for monte carlo
         trial_seqs, trial_evals = self._mc_core(n_samples, weighting)
         
@@ -214,24 +253,14 @@ class SequenceOptimiser:
         best_seqs = trial_seqs[sorted_idx[:population_size]]
         best_evals = trial_evals[sorted_idx[:population_size]]
         
-        if comparison_sequence is not None:
-            comparison_mse = self.env.evaluate_sequences(comparison_sequence[np.newaxis, :], weighting)[0]
-            print(comparison_mse)
-            if time_to_beat:
-                if best_evals[0] < comparison_mse:
-                    duration = time.perf_counter() - start_time
-                    print(f"Hybrid Search improved on comparison scan in {duration:.4f}s")
-                    return best_seqs[0], best_evals[0], duration
-                elif best_evals[0] == 0:
-                    duration = time.perf_counter() - start_time
-                    print(f"Hybrid Search found a sequence with an error function of 0 in {duration:.4f}s")
-                    return best_seqs[0], best_evals[0], duration, -improvement
+        # Check if the initial random population already beats the target improvement
+        imp = check_target(best_evals[0])
+        if imp is not False:
+            duration = time.perf_counter() - start_time
+            print(f"Target reached instantly: {imp*100:.2f}% improvement in {duration:.4f}s")
+            return best_seqs[0], best_evals[0], duration, imp
 
         for gen in range(generations):
-            # Track local updates
-            n_improved = 0
-            n_replaced = 0
-            # Search best sequences locally
             for i in range(population_size):
                 # Try to improve locally
                 neighbours = self._get_all_pair_swaps(best_seqs[i])
@@ -244,27 +273,21 @@ class SequenceOptimiser:
                 if best_neighbour_mse < best_evals[i]:
                     best_evals[i] = best_neighbour_mse
                     best_seqs[i] = neighbours[best_neighbour_idx]
-                    n_improved += 1
-                    if time_to_beat:
-                        if best_evals[i] < comparison_mse:
-                            duration = time.perf_counter() - start_time
-                            print(f"Hybrid Search improved on comparison scan in {duration:.4f}s")
-                            return best_seqs[0], best_evals[0], duration
-                        elif best_evals[i] == 0:
-                            duration = time.perf_counter() - start_time
-                            print(f"Hybrid Search found a sequence with an error function of 0 in {duration:.4f}s")
-                            return best_seqs[0], best_evals[0], duration, -improvement
-
-                #If not, is this the best sequence so far, replace with mc sequence
-                elif i > 0:
                     
+                    # Check if local swap meets target improvement
+                    imp = check_target(best_evals[i])
+                    if imp is not False:
+                        duration = time.perf_counter() - start_time
+                        print(f"Target reached during local search: {imp*100:.2f}% improvement in {duration:.4f}s")
+                        return best_seqs[i], best_evals[i], duration, imp
+
+                # Replace stagnant sequence with new MC sample
+                elif i > 0:
                     new_seqs, new_evals = self._mc_core(n_samples//population_size, weighting)
                     
                     best_new_idx = np.argmin(new_evals)
-                    
                     best_seqs[i] = new_seqs[best_new_idx]
                     best_evals[i] = new_evals[best_new_idx]
-                    n_replaced += 1
 
             # Find new best monte carlo solutions
             new_seqs, new_evals = self._mc_core(n_samples, weighting)
@@ -272,38 +295,36 @@ class SequenceOptimiser:
             # Replace top 10 sequences with better new monte carlo sequences
             combined_seqs = np.vstack((best_seqs, new_seqs))
             combined_evals = np.concatenate((best_evals, new_evals))
-            
             top_idx = np.argsort(combined_evals)[:population_size]
-            
-            # Track how many new monte carlo sequences are taken in the best sequences
-            num_new_entries = np.sum(top_idx >= population_size)
-            #print(f"Gen {gen}: Optimised {n_improved} sequences locally, replaced {n_replaced} stagnant sequences, accepted {num_new_entries} new Monte Carlo sequences.")
             
             best_seqs = combined_seqs[top_idx]
             best_evals = combined_evals[top_idx]
-            if time_to_beat:
-                if best_evals[0] < comparison_mse:
-                    duration = time.perf_counter() - start_time
-                    print(f"Hybrid Search improved on comparison scan in {duration:.4f}s")
-                    return best_seqs[0], best_evals[0], duration
-                elif best_evals[0] == 0:
-                    duration = time.perf_counter() - start_time
-                    print(f"Hybrid Search found a sequence with an error function of 0 in {duration:.4f}s")
-                    return best_seqs[0], best_evals[0], duration
+            
+            # Check target after global population update
+            imp = check_target(best_evals[0])
+            if imp is not False:
+                duration = time.perf_counter() - start_time
+                print(f"Target reached after MC injection: {imp*100:.2f}% improvement in {duration:.4f}s")
+                return best_seqs[0], best_evals[0], duration, imp
 
-        if comparison_sequence is not None:
-            improvement =  (best_evals[0] - comparison_mse) / comparison_mse
-            if improvement < 0:
-                print(f'The Hybrid Search sequence improves on the comparison sequence by {-improvement*100:.2f}%')
-            elif improvement > 0:
-                print(f'The Hybrid Search sequence is worse than the comparison sequence by {improvement*100:.2f}%')
-            else:
-                print('The Hybrid search has found a sequence with error function equal to the comparison sequence')
-        
         duration = time.perf_counter() - start_time
-        print(f"Hybrid Search completed in {duration:.4f}s")
-        if not time_track:
-            return best_seqs[0], best_evals[0]
-        else:
-            return best_seqs[0], best_evals[0], duration, -improvement
+        final_improvement = None
         
+        if comparison_sequence is not None:
+            if comparison_mse != 0:
+                final_improvement =  (best_evals[0] - comparison_mse) / comparison_mse
+                if final_improvement > 0:
+                    print(f"Completed: Sequence improved on comparison by {final_improvement*100:.2f}% in {duration:.4f}s")
+                elif final_improvement < 0:
+                    print(f"Completed: Sequence is worse than comparison by {-final_improvement*100:.2f}% in {duration:.4f}s")
+                else:
+                    print(f"Completed: Sequence matches the comparison exactly in {duration:.4f}s")
+            else:
+                final_improvement = 0.0
+                
+        else:
+            final_improvement = 0.0
+                
+        print(f"Hybrid Search completed in {duration:.4f}s")
+            
+        return best_seqs[0], best_evals[0], duration, final_improvement
