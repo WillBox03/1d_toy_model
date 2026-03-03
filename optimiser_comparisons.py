@@ -54,9 +54,9 @@ if __name__ == "__main__":
             
             opt = SequenceOptimiser(env)
             
-            _, mse_sa[j,i,0], mse_sa[j,i,1] = opt.run('simanneal', iterations = sa_params[j], temp = 0.3, final_temp = 0.001, time_track = True)
+            _, mse_sa[j,i,0], mse_sa[j,i,1] = opt.run('simanneal', iterations = sa_params[j], pop_size = 5, temp = 0.3, final_temp = 0.001)
             
-            _, mse_mc[j,i,0] ,mse_mc[j,i,1] = opt.run("montecarlo",n_samples = mc_params[j], time_track = True)
+            _, mse_mc[j,i,0] ,mse_mc[j,i,1] = opt.run("montecarlo",n_samples = mc_params[j])
             
             _, mse_h[j,i,0], mse_h[j,i,1], _ = opt.run("mcghybrid", n_samples = h_params[j,0], generations = h_params[j,1])
             

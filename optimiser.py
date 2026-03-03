@@ -62,28 +62,62 @@ class SequenceOptimiser:
         return sequences, evals
         
     def _get_all_pair_swaps(self, sequence):
-        """Generates all possible 2-spot swaps for a given sequence"""
+        """Generates all possible 2-spot swaps for a given sequence
+            Works for any number of sequences
+        """
         
-        num_swaps = comb(len(sequence), 2)
-        sequences = np.tile(sequence, (num_swaps, 1))
+        if sequence.ndim == 1:
+            num_swaps = comb(len(sequence), 2)
+            sequences = np.tile(sequence, (num_swaps, 1))
         
-        swap_indices = np.array(list(combinations(range(len(sequence)), 2)))
+            swap_indices = np.array(list(combinations(range(len(sequence)), 2)))
+            
+            # Vectorized swap
+            sequences[np.arange(num_swaps)[:, None], swap_indices] = \
+            sequences[np.arange(num_swaps)[:, None], np.flip(swap_indices, axis=-1)]
         
-        # Vectorized swap
-        sequences[np.arange(num_swaps)[:, None], swap_indices] = \
-        sequences[np.arange(num_swaps)[:, None], np.flip(swap_indices, axis=-1)]
-        
+        elif sequence.ndim == 2:
+            pop_size, seq_len = sequence.shape
+            num_swaps = comb(seq_len, 2)
+            
+            sequences = np.tile(sequence[:, np.newaxis, :], (1, num_swaps, 1))
+            swap_indices = np.array(list(combinations(range(seq_len), 2)))
+            
+            # Vectorised swap
+            col1, col2, = swap_indices[:, 0], swap_indices[:, 1]
+            
+            temp = sequences[:, np.arange(num_swaps), col1].copy()
+            sequences[:, np.arange(num_swaps), col1] = sequences[:, np.arange(num_swaps), col2]
+            sequences[:, np.arange(num_swaps), col2] = temp
+            
         return sequences
-    
+                
     def _get_random_swap(self, sequence):
-        """Returns a copy of the sequence with two random spots swapped"""
+        """
+        Returns a copy of the sequence with two random spots swapped
+        Works for any number of sequences
+        """
         seq_copy = sequence.copy()
-        idx = range(len(seq_copy))
-        i1, i2 = np.random.choice(idx, 2, replace=False)
-        seq_copy[i1], seq_copy[i2] = seq_copy[i2], seq_copy[i1]
+        
+        if seq_copy.ndim == 1:
+            seq_len = len(seq_copy)
+            i1, i2 = np.random.choice(seq_len, 2, replace=False)
+            seq_copy[i1], seq_copy[i2] = seq_copy[i2], seq_copy[i1]
+        # Handles multiple input sequences
+        elif seq_copy.ndim == 2:
+            pop_size, seq_len = seq_copy.shape
+            row_idx = np.arange(pop_size)
+            #Generate random columns
+            col1 = self.rng.integers(0, seq_len, size=pop_size)
+            col2 = (col1 + self.rng.integers(1, seq_len, size = pop_size)) % seq_len
+            # Swap across all rows
+            temp = seq_copy[row_idx, col1].copy()
+            seq_copy[row_idx, col1] = seq_copy[row_idx, col2]
+            seq_copy[row_idx, col2] = temp
+            
         return seq_copy
     
-    def monte_carlo(self, n_samples = 10000, weighting=True, time_track = False):
+    def monte_carlo(self, n_samples = 10000, weighting=True):
         
         print(f"Running Monte Carlo ({n_samples} samples)")
         start_time = time.perf_counter()
@@ -93,10 +127,7 @@ class SequenceOptimiser:
         
         duration = time.perf_counter() - start_time
         print(f"Monte Carlo completed in {duration:.4f}s")
-        if not time_track:
-            return sequences[best_idx], evals[best_idx]
-        else:
-            return sequences[best_idx], evals[best_idx], duration
+        return sequences[best_idx], evals[best_idx], duration
     
     def exhaustive(self, weighting=True):
         if self.seq_len > 11:
@@ -151,79 +182,85 @@ class SequenceOptimiser:
         print(f"Greedy Search completed in {duration:.4f}s")
         return current_seq, current_mse
     
-    def simulated_annealing(self, iterations=1000, temp=1.0, weighting=True, n_bins = 10, final_temp = 0.001, debug = False, time_track = False):
+    def simulated_annealing(self, iterations=1000, pop_size = 5, temp=1.0, final_temp = 0.001, n_bins = 10, weighting=True, debug = False):
         print("Running Simulated Annealing")
         start_time = time.perf_counter()
         
         # Initialize
-        current_seq = self.base_sequence.copy()
-        self.rng.shuffle(current_seq)
-        current_mse = self.env.evaluate_sequences(current_seq[np.newaxis, :], weighting)[0]
+        starting_mat = np.tile(self.base_sequence, (pop_size, 1))
+        current_seqs = self.rng.permuted(starting_mat, axis = 1)
+        
+        current_mses = self.env.evaluate_sequences(current_seqs, weighting)
         
         # Track Global Best
-        best_seq = current_seq.copy()
-        best_mse = current_mse
-        
-        T = temp
-        accepted = 0
-        acceptance_bins = np.zeros((n_bins))
-        bin_size = iterations / n_bins
-        best_updates = 0
-        
+        best_idx = np.argmin(current_mses)
+        best_seq = current_seqs[best_idx].copy()
+        best_mse = current_mses[best_idx]
+    
         # Calculate the cooling factor
-        final_temp = final_temp
+        T = temp
         cooling_fact = (final_temp / temp) ** (1 / iterations)
         #print(f'Cooling factor set to {cooling_fact}')
         
+        # Setup tracking for debugging
+        accepted = 0
+        acceptance_bins = np.zeros((n_bins))
+        bin_size = iterations / n_bins
         mse_walker = np.zeros(iterations)
         
         for i in range(iterations):
-            test_seq = self._get_random_swap(current_seq)
-            test_mse = self.env.evaluate_sequences(test_seq[np.newaxis, :], weighting)[0]
+            test_seqs = self._get_random_swap(current_seqs)
+            test_mses = self.env.evaluate_sequences(test_seqs, weighting)
             
-            diff = test_mse - current_mse
+            diffs = test_mses - current_mses
             accepted_step = False
             
-            # Acceptance Logic
-            if diff < 0:
-                current_seq = test_seq
-                current_mse = test_mse
-                accepted += 1
-                accepted_step = True
-                
-                # Update Global Record
-                if current_mse < best_mse:
-                    best_mse = current_mse
-                    best_seq = current_seq.copy()
-                    best_updates += 1
-                    #print(f'Global best sequence updated with MSE = {best_mse}, update number {best_updates}, iteration {i}')     
+            # Check for natural improvement
+            improved_mask = diffs < 0
             
-            else:
-                prob = np.exp(-(diff/current_mse) / T)
-                if np.random.rand() < prob:
-                    current_seq = test_seq
-                    current_mse = test_mse
-                    accepted_step = True
-                    accepted += 1
+            # Allow worse sequences if they pass temp test
+            probs = np.exp(-(diffs/current_mses) / T)
+            randoms = self.rng.random(pop_size)
+            prob_mask = (diffs >= 0) & (randoms < probs)
+            
+            # Combine masks
+            accept_mask = improved_mask | prob_mask
+            
+            # Update sequences and MSEs if accepted
+            current_seqs[accept_mask] = test_seqs[accept_mask]
+            current_mses[accept_mask] = test_mses[accept_mask]
+            
+            # Update global best if needed
+            min_current_idx = np.argmin(current_mses)
+            if current_mses[min_current_idx] < best_mse:
+                best_mse = current_mses[min_current_idx]
+                best_seq = current_seqs[min_current_idx].copy()
+                
+            # Count accepted sequences in this iteration
+            accepted_iter = np.sum(accept_mask)
+            accepted += accepted_iter
 
-            if accepted_step:
+            if accepted_iter > 0:
                 bin_idx = int(min(i // bin_size, n_bins - 1))
-                acceptance_bins[bin_idx] += 1
-                
-            mse_walker[i] = current_mse
-                
+                acceptance_bins[bin_idx] += accepted_iter
+            
+            # Cool temp
             T *= cooling_fact
+            
+            # Track the average MSE
+            mse_walker[i] = np.mean(current_mses)
         
-        acceptance_bins /= bin_size
+        acceptance_bins = acceptance_bins / (bin_size * pop_size)
+        total_evals = iterations * pop_size
+        
         duration = time.perf_counter() - start_time
-        print(f"SA completed in {duration:.4f}s (Acceptance: {accepted/iterations:.1%})")
+        
+        print(f"SA completed in {duration:.4f}s (Acceptance: {accepted/total_evals:.1%})")
         if debug == True:
-            return best_seq, best_mse, acceptance_bins, mse_walker
-        elif not time_track:
-            return best_seq, best_mse
+            return best_seq, best_mse, acceptance_bins, mse_walker,duration
         else:
             return best_seq, best_mse, duration
-    
+      
     def mc_greedy_hybrid(self, n_samples=1000, generations=10, population_size = 10, weighting=True, comparison_sequence = None, target_improvement=None):
         
         print("Running Monte Carlo Greedy Hybrid")
@@ -261,33 +298,47 @@ class SequenceOptimiser:
             return best_seqs[0], best_evals[0], duration, imp
 
         for gen in range(generations):
-            for i in range(population_size):
-                # Try to improve locally
-                neighbours = self._get_all_pair_swaps(best_seqs[i])
-                neighbour_evals = self.env.evaluate_sequences(neighbours, weighting)
+            # Try to improve locally
+            all_neighbours = self._get_all_pair_swaps(best_seqs)
+            num_swaps = all_neighbours.shape[1]
+            
+            # Flatten to evaluate
+            all_neighbours_flat = all_neighbours .reshape(-1, self.seq_len)
+            evals_flat = self.env.evaluate_sequences(all_neighbours_flat, weighting)
+            neighbour_evals = evals_flat.reshape(population_size, num_swaps)
+            
+            #Find the best of the local updates
+            best_neighbour_idx = np.argmin(neighbour_evals, axis = 1)
+            best_neighbour_mses = neighbour_evals[np.arange(population_size), best_neighbour_idx]
+            
+            # Which sequences improved locally
+            improved_mask = best_neighbour_mses < best_evals
+            
+            best_evals[improved_mask] = best_neighbour_mses[improved_mask]
+            best_seqs[improved_mask] = all_neighbours[improved_mask, best_neighbour_idx[improved_mask]]
+            
+            # Which sequences are stagnated and need replacing
+            stagnant_mask = ~improved_mask
+            stagnant_mask[0] = False # Avoids replacing the global best
+            
+            num_stagnant = np.sum(stagnant_mask)
+            
+            if num_stagnant > 0:
+                #Generate enough MC samples for the replacement of each stagnant sequence
+                n_new_samples = (n_samples // population_size) * num_stagnant
+                new_seqs, new_evals = self._mc_core(n_new_samples, weighting)
+                    
+                # Find the best new relacement sequences
+                top_new_idx = np.argsort(new_evals)[:num_stagnant]
+                best_seqs[stagnant_mask] = new_seqs[top_new_idx]
+                best_evals[stagnant_mask] = new_evals[top_new_idx]
                 
-                #Find the best of the local updates
-                best_neighbour_idx = np.argmin(neighbour_evals)
-                best_neighbour_mse = neighbour_evals[best_neighbour_idx]
-                #Does this improve on the original
-                if best_neighbour_mse < best_evals[i]:
-                    best_evals[i] = best_neighbour_mse
-                    best_seqs[i] = neighbours[best_neighbour_idx]
-                    
-                    # Check if local swap meets target improvement
-                    imp = check_target(best_evals[i])
-                    if imp is not False:
-                        duration = time.perf_counter() - start_time
-                        print(f"Target reached during local search: {imp*100:.2f}% improvement in {duration:.4f}s")
-                        return best_seqs[i], best_evals[i], duration, imp
-
-                # Replace stagnant sequence with new MC sample
-                elif i > 0:
-                    new_seqs, new_evals = self._mc_core(n_samples//population_size, weighting)
-                    
-                    best_new_idx = np.argmin(new_evals)
-                    best_seqs[i] = new_seqs[best_new_idx]
-                    best_evals[i] = new_evals[best_new_idx]
+            # Check if local swap meets target improvement
+            imp = check_target(best_evals[0])
+            if imp is not False:
+                duration = time.perf_counter() - start_time
+                print(f"Target reached during local search: {imp*100:.2f}% improvement in {duration:.4f}s")
+                return best_seqs[0], best_evals[0], duration, imp
 
             # Find new best monte carlo solutions
             new_seqs, new_evals = self._mc_core(n_samples, weighting)
@@ -295,8 +346,8 @@ class SequenceOptimiser:
             # Replace top 10 sequences with better new monte carlo sequences
             combined_seqs = np.vstack((best_seqs, new_seqs))
             combined_evals = np.concatenate((best_evals, new_evals))
-            top_idx = np.argsort(combined_evals)[:population_size]
             
+            top_idx = np.argsort(combined_evals)[:population_size]
             best_seqs = combined_seqs[top_idx]
             best_evals = combined_evals[top_idx]
             
