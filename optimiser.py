@@ -1,13 +1,104 @@
-import ITV_engine
 import numpy as np
 from math import factorial, comb
 from itertools import combinations
+from numba import njit, prange
 import time
 
-import sys
+from ITV_engine import _evaluation_core_single
 
-np.set_printoptions(threshold=sys.maxsize)
+@njit(parallel=True, cache=True)
+def _sa_core(tensor, intended, start_seqs, iterations, temp, c_fact, weighting, n_bins):
+    
+    pop_size = start_seqs.shape[0]
+    seq_len = start_seqs.shape[1]
+    
+    final_best_seqs = np.zeros_like(start_seqs)
+    final_best_mses = np.zeros(pop_size)
+    
+    # Pre-allocate all debug matrices
+    all_mse_walkers = np.zeros((pop_size, iterations), dtype=np.float64)
+    all_acceptance_bins = np.zeros((pop_size, n_bins), dtype=np.float64)
+    total_accepted = np.zeros(pop_size, dtype=np.int32)
+    
+    bin_size = iterations / n_bins
+    
+    # Split into parallel threads
+    for p in prange(pop_size):
+        # Initialise sequencing variables
+        current_seq = start_seqs[p].copy()
+        test_seq = start_seqs[p].copy()
+        best_seq = start_seqs[p].copy()
+        time_1d = np.zeros(seq_len, dtype=np.int16)
+        
+        # Find the time of the initial sequence
+        time_1d[0] = 0
+        for s in range(1, seq_len):
+            time_1d[s] = time_1d[s-1] + abs(current_seq[s] - current_seq[s-1])
+        
+        # Evaluate initial sequence    
+        current_mse = _evaluation_core_single(tensor, intended, current_seq, time_1d, weighting)
+        best_mse = current_mse
+        
+        T = temp 
+        
+        accepted_count = 0 #Debugging param for acceptance rate
+        
+        # Main SA chain
+        for i in range(iterations):
+            # Perform random swap
+            idx1 = np.random.randint(0, seq_len)
+            idx2 = np.random.randint(0, seq_len)
+            while idx1 == idx2 or current_seq[idx1] == current_seq[idx2]:
+                idx2 = np.random.randint(0, seq_len)
+                
+            test_seq[idx1], test_seq[idx2] = test_seq[idx2], test_seq[idx1]
+            
+            # Recalculate sequence time
+            time_1d[0] = 0
+            for s in range(1, seq_len):
+                time_1d[s] = time_1d[s-1] + abs(test_seq[s] - test_seq[s-1])
+            
+            # Recalculate error and find difference
+            test_mse = _evaluation_core_single(tensor, intended, test_seq, time_1d, weighting)
+            diff = test_mse - current_mse
+            
+            accepted_iter = 0 # Acceptance param
+            
+            # Acceptance condition
+            if diff < 0 or np.random.rand() < np.exp(-(diff / current_mse) / T):
+                # Accept
+                for s in range(seq_len):
+                    current_seq[s] = test_seq[s]
+                current_mse = test_mse
+                accepted_iter = 1
+                accepted_count += 1
+                # Check if new sequence is the best
+                if current_mse < best_mse:
+                    best_mse = current_mse
+                    for s in range(seq_len):
+                        best_seq[s] = current_seq[s]
+            else:
+                # Reject
+                test_seq[idx1], test_seq[idx2] = test_seq[idx2], test_seq[idx1]
+                
+            T *= c_fact # Cool temp    
+            
+            # Record debug info for the thread
+            all_mse_walkers[p, i] = current_mse
+            if accepted_iter > 0:
+                bin_idx = int(min(i // bin_size, n_bins - 1))
+                all_acceptance_bins[p, bin_idx] += 1
+            
+        # Save best sequence in thread
+        final_best_mses[p] = best_mse
+        for s in range(seq_len):
+            final_best_seqs[p, s] = best_seq[s]
+            
+        total_accepted[p] = accepted_count
 
+    return final_best_seqs, final_best_mses, all_acceptance_bins, all_mse_walkers, total_accepted
+        
+        
 class SequenceOptimiser:
     
     def __init__(self, env):
@@ -91,31 +182,6 @@ class SequenceOptimiser:
             sequences[:, np.arange(num_swaps), col2] = temp
             
         return sequences
-                
-    def _get_random_swap(self, sequence):
-        """
-        Returns a copy of the sequence with two random spots swapped
-        Works for any number of sequences
-        """
-        seq_copy = sequence.copy()
-        
-        if seq_copy.ndim == 1:
-            seq_len = len(seq_copy)
-            i1, i2 = np.random.choice(seq_len, 2, replace=False)
-            seq_copy[i1], seq_copy[i2] = seq_copy[i2], seq_copy[i1]
-        # Handles multiple input sequences
-        elif seq_copy.ndim == 2:
-            pop_size, seq_len = seq_copy.shape
-            row_idx = np.arange(pop_size)
-            #Generate random columns
-            col1 = self.rng.integers(0, seq_len, size=pop_size)
-            col2 = (col1 + self.rng.integers(1, seq_len, size = pop_size)) % seq_len
-            # Swap across all rows
-            temp = seq_copy[row_idx, col1].copy()
-            seq_copy[row_idx, col1] = seq_copy[row_idx, col2]
-            seq_copy[row_idx, col2] = temp
-            
-        return seq_copy
     
     def monte_carlo(self, n_samples = 10000, weighting=True):
         
@@ -190,76 +256,35 @@ class SequenceOptimiser:
         starting_mat = np.tile(self.base_sequence, (pop_size, 1))
         current_seqs = self.rng.permuted(starting_mat, axis = 1)
         
-        current_mses = self.env.evaluate_sequences(current_seqs, weighting)
-        
-        # Track Global Best
-        best_idx = np.argmin(current_mses)
-        best_seq = current_seqs[best_idx].copy()
-        best_mse = current_mses[best_idx]
+        # Cooling factor
+        c_fact = (final_temp / temp) ** (1.0 / iterations)
     
-        # Calculate the cooling factor
-        T = temp
-        cooling_fact = (final_temp / temp) ** (1 / iterations)
-        #print(f'Cooling factor set to {cooling_fact}')
+        # Run SA core
+        best_seqs, best_mses, all_bins, all_walkers, all_accepted = _sa_core(self.env.tensor, self.env.get_intended_dist(), current_seqs, iterations, temp, c_fact, weighting, n_bins)
         
-        # Setup tracking for debugging
-        accepted = 0
-        acceptance_bins = np.zeros((n_bins))
+        # FInd global minimum
+        best_idx = np.argmin(best_mses)
+        global_best_seq = best_seqs[best_idx]
+        global_best_mse = best_mses[best_idx]
+        
+        # Average debug trackers
         bin_size = iterations / n_bins
-        mse_walker = np.zeros(iterations)
-        
-        for i in range(iterations):
-            test_seqs = self._get_random_swap(current_seqs)
-            test_mses = self.env.evaluate_sequences(test_seqs, weighting)
-            
-            diffs = test_mses - current_mses
-            accepted_step = False
-            
-            # Check for natural improvement
-            improved_mask = diffs < 0
-            
-            # Allow worse sequences if they pass temp test
-            probs = np.exp(-(diffs/current_mses) / T)
-            randoms = self.rng.random(pop_size)
-            prob_mask = (diffs >= 0) & (randoms < probs)
-            
-            # Combine masks
-            accept_mask = improved_mask | prob_mask
-            
-            # Update sequences and MSEs if accepted
-            current_seqs[accept_mask] = test_seqs[accept_mask]
-            current_mses[accept_mask] = test_mses[accept_mask]
-            
-            # Update global best if needed
-            min_current_idx = np.argmin(current_mses)
-            if current_mses[min_current_idx] < best_mse:
-                best_mse = current_mses[min_current_idx]
-                best_seq = current_seqs[min_current_idx].copy()
-                
-            # Count accepted sequences in this iteration
-            accepted_iter = np.sum(accept_mask)
-            accepted += accepted_iter
-
-            if accepted_iter > 0:
-                bin_idx = int(min(i // bin_size, n_bins - 1))
-                acceptance_bins[bin_idx] += accepted_iter
-            
-            # Cool temp
-            T *= cooling_fact
-            
-            # Track the average MSE
-            mse_walker[i] = np.mean(current_mses)
-        
-        acceptance_bins = acceptance_bins / (bin_size * pop_size)
         total_evals = iterations * pop_size
+        accepted = np.sum(all_accepted)
+        
+        # Sum bins across threads and find percentage
+        acceptance_bins = np.sum(all_bins, axis=0) / (bin_size * pop_size)
+        
+        # Average MSE across all walkers
+        mse_walker = np.mean(all_walkers, axis=0)
         
         duration = time.perf_counter() - start_time
+        print(f"SA completed in {duration:.4f}s (Overall Acceptance of New Solutions: {accepted/total_evals:.1%})")
         
-        print(f"SA completed in {duration:.4f}s (Acceptance: {accepted/total_evals:.1%})")
-        if debug == True:
-            return best_seq, best_mse, acceptance_bins, mse_walker,duration
+        if debug:
+            return global_best_seq, global_best_mse, acceptance_bins, mse_walker, duration
         else:
-            return best_seq, best_mse, duration
+            return global_best_seq, global_best_mse, duration
       
     def mc_greedy_hybrid(self, n_samples=1000, generations=10, population_size = 10, weighting=True, comparison_sequence = None, target_improvement=None):
         

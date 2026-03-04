@@ -44,8 +44,12 @@ if __name__ == "__main__":
     mse_h  = np.zeros((times, repeats, 2))
     
     sa_params = np.array([1100,5600,12000,28000,58000])
-    mc_params = np.array([3500, 18000, 36000, 90000, 180000])
+    mc_params = np.array([3500, 18000, 360000, 900000, 1800000])
     h_params = np.array([[250,4],[900,10],[900,20],[1500,35],[1500,70]])
+    
+    print("Warming up compilers...")
+    opt.run('simanneal', iterations=10, pop_size=2, temp=0.3, final_temp=0.001)
+    opt.run('montecarlo', n_samples=10)
     
     for j in range(times):
         for i in range(repeats):
@@ -54,13 +58,13 @@ if __name__ == "__main__":
             
             opt = SequenceOptimiser(env)
             
-            _, mse_sa[j,i,0], mse_sa[j,i,1] = opt.run('simanneal', iterations = sa_params[j], pop_size = 5, temp = 0.3, final_temp = 0.001)
+            _, mse_sa[j,i,0], mse_sa[j,i,1] = opt.run('simanneal', iterations = sa_params[j], pop_size = 20, temp = 0.3, final_temp = 0.001)
             
             _, mse_mc[j,i,0] ,mse_mc[j,i,1] = opt.run("montecarlo",n_samples = mc_params[j])
             
             _, mse_h[j,i,0], mse_h[j,i,1], _ = opt.run("mcghybrid", n_samples = h_params[j,0], generations = h_params[j,1])
             
-            time.sleep(0.5* (j + 1))
+            time.sleep(0.2 * (j + 1))
 
     sa_means = np.mean(mse_sa, axis=1) # Shape: (5, 2)
     sa_stds  = np.std(mse_sa, axis=1)

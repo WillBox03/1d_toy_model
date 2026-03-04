@@ -1,6 +1,80 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from numba import njit, prange
 
+@njit(parallel=True, cache = True)
+def _evaluation_core(tensor, intended, sequences, time_indices, weighting):
+    
+    n_sequences = sequences.shape[0]
+    n_phases = tensor.shape[0]
+    n_voxels = tensor.shape[3]
+    seq_len = sequences.shape[1]
+    
+    evals = np.zeros(n_sequences)
+    
+    for i in prange(n_sequences):
+        total_sq_diff = 0.0
+        
+        # Hold dosage for this phase
+        phase_dose = np.zeros(n_voxels)
+        for p in range(n_phases):
+            phase_dose = np.zeros(n_voxels)
+            
+            # For each sequence spot
+            for s in range(seq_len):
+                spot = sequences[i, s]
+                time_idx = time_indices[i, s]
+                
+                # For each voxel
+                for v in range(n_voxels):
+                    phase_dose[v] += tensor[p, spot, time_idx, v]
+            
+            # Calculate MSE for the phase
+            for v in range(n_voxels):
+                diff = phase_dose[v] - intended[v]
+                sq_diff = diff * diff
+                
+                if weighting and diff < 0:
+                    sq_diff *= 5.0
+                    
+                total_sq_diff += sq_diff
+                
+        # Average it out
+        evals[i] = total_sq_diff / (n_phases * n_voxels)
+        
+    return evals
+
+@njit(cache = True)
+def _evaluation_core_single(tensor, intended, seq, time_indices, weighting):
+    
+    n_phases = tensor.shape[0]
+    n_voxels = tensor.shape[3]
+    seq_len = seq.shape[0]
+    
+    total_sq_diff = 0.0
+    phase_dose = np.zeros(n_voxels) # Allocate once!
+    
+    for p in range(n_phases):
+        # Zero out the dose array
+        for v in range(n_voxels):
+            phase_dose[v] = 0.0
+            
+        # Accumulate dose (Fast contiguous memory read)
+        for s in range(seq_len):
+            spot = seq[s]
+            time_idx = time_indices[s]
+            for v in range(n_voxels):
+                phase_dose[v] += tensor[p, spot, time_idx, v]
+                
+        # Calculate Error
+        for v in range(n_voxels):
+            diff = phase_dose[v] - intended[v]
+            sq_diff = diff * diff
+            if weighting and diff < 0:
+                sq_diff *= 5.0
+            total_sq_diff += sq_diff
+            
+    return total_sq_diff / (n_phases * n_voxels)
 class ITV_env:   
     '''
     Environment space for the simulation
@@ -262,38 +336,14 @@ class ITV_env:
             weighting(bool): Determines whether weighted mse or regular mse is used for evaluation
         """
         
-        n_sequences = sequences.shape[0]
-        intended = self.get_intended_dist()
-        
         # Calculate physical jump distances
         jumps = np.abs(np.diff(sequences, axis=1))
 
-        # Finding the cumulative jump distances aas tensor indices
+        # Finding the cumulative jump distances as tensor indices
         time_indices = np.zeros(sequences.shape, dtype=int)
         time_indices[:, 1:] = np.cumsum(jumps, axis=1)
         
-        #Generate empty array for all mses
-        evals = np.zeros(n_sequences)
-        
-        #Loop through each sequence
-        for i in range(n_sequences):
-            
-            # Find the dose distributions for each beam point at the correct time for all required phases    
-            dists = self.tensor[:, sequences[i], time_indices[i], :].sum(axis=1)
-            
-            # Find the squared differences between the distributions and intended across all phases
-            # Evaluates using WMSE
-            diffs = dists - intended
-            
-            sq_diffs = diffs**2
-            
-            if weighting:
-                sq_diffs[diffs<0] *= 5
-            
-            # Average across voxels and required phases
-            evals[i] = np.mean(sq_diffs)
-        
-        return evals
+        return _evaluation_core(self.tensor, self.get_intended_dist(), sequences, time_indices, weighting)     
     
     def display_sims(self, sims, labels = None):
         '''
