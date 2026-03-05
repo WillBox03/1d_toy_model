@@ -254,7 +254,7 @@ class ITV_env:
         #Resulting tensor has dimensions (P,S,T,V)
         self.tensor = (env_space > (left_edges - all_shifts)) & (env_space < (right_edges - all_shifts))
     
-    def evaluate_sequences(self, sequences, weighting = False):
+    def evaluate_sequences(self, sequences, weighting = True):
         """
         Calculates MSE for a batch of sequences.
         Args:
