@@ -1,4 +1,5 @@
 import numpy as np
+import math
 import matplotlib.pyplot as plt
 from numba import njit, prange
 
@@ -79,7 +80,7 @@ class ITV_env:
     '''
     Environment space for the simulation
     '''
-    def __init__(self, res, env_length, n_spots, amp, spot_size = None):
+    def __init__(self, res, env_length, n_spots, amp, spot_size = None, t_step = 0.1, t_switch = 0.5):
         '''
         Initialises the environment, creating a high resolution coordinate space for the env of set length. Also defines positions of proton beam spots covering the ITV
         Args:
@@ -89,11 +90,30 @@ class ITV_env:
             amp(float): Amplitude of breathing motion, in cm
             spot_size (float): Physical width of spot in cm
         '''
+        
         if spot_size is None:
             spot_size = (env_length + (2*amp)) / n_spots
         
+        self.update_env(res=res, env_length=env_length, amp=amp, n_spots=n_spots, spot_size=spot_size, t_step=t_step, t_switch=t_switch)
         
-        self.update_env(res=res, env_length=env_length, amp=amp, n_spots=n_spots, spot_size=spot_size)
+        # Convert seconds to integers
+        multiplier = 100000 # Correct for floating point errors
+        int_step = int(np.round(self.t_step * multiplier))
+        int_switch = int(np.round(self.t_switch * multiplier))
+        
+        # Find the greatest common divisor to get the engine tick time
+        gcd_val = math.gcd(int_step, int_switch)
+        self.tick_time = gcd_val / multiplier
+        
+        # Calculate number of ticks for stepping and energy switching
+        self.t_step_ticks = int(np.round(self.t_step / self.tick_time))
+        self.t_switch_ticks = int(np.round(self.t_switch / self.tick_time))
+        
+        self.mode_presets = {
+            '1d': 0,
+            'q2dslice': self.t_step_ticks, 
+            'q2dlayer': self.t_switch_ticks
+        } 
                 
     def update_env(self, **kwargs):
         '''
@@ -105,6 +125,8 @@ class ITV_env:
         if 'amp' in kwargs: self.amp = kwargs['amp']
         if 'n_spots' in kwargs: self.n_spots = kwargs['n_spots']
         if 'spot_size' in kwargs: self.spot_size = kwargs['spot_size']
+        if 't_step' in kwargs: self.t_step = kwargs['t_step']
+        if 't_switch' in kwargs: self.t_switch = kwargs['t_switch']
         
         # Boundaries of env and ITV
         self.env_half_length = self.env_length / 2
@@ -203,25 +225,36 @@ class ITV_env:
 
         return sequence
 
-    def sim(self, timestep, period, sequence, starting_phase = None, weighting = True):
+    def sim(self, period, sequence, starting_phase = None, weighting = True, mode = '1d'):
         
         '''
         Simulates spot scanning sequence in a moving target, returning the resultant dose distribution
         Args:
-            timestep (float): Time taken for proton beam to move to adjacent spots, in s
+            t_step (float): Time taken for proton beam to move to adjacent spots, in s
             period (float): Period of breathing motion, in s
             sequence (arr, str): Sequence for proton beam spots
         '''
+        
+        if mode not in self.mode_presets:
+            raise ValueError(f'Mode "{mode}" not recognised. Available: {list(self.mode_presets.keys())}')
+        
         sequence = self.set_sequence(sequence)
         
         phase = 2*np.pi/period # Phase of breathing
         
         jumps = abs(sequence[1:] - sequence[:-1]) # Distance between each proton beam spot in sequence
-    
-        # Cumulative time taken to move to each proton beam spot in sequence
-        times = np.zeros(len(jumps) + 1)
+
+        ticks = jumps * self.t_step_ticks
         
-        times[1:] = np.cumsum(jumps) * timestep
+        # Apply mode penalty to 0 jumps
+        ticks[jumps == 0] = self.mode_presets.get(mode, 0)
+        
+        # Accumulate the integers ticks
+        cumulative_ticks = np.zeros(len(jumps) + 1, dtype=int)
+        cumulative_ticks[1:] = np.cumsum(ticks)
+        
+        # Convert ticks to seconds for physical calculations
+        times = cumulative_ticks * self.tick_time
         
         if starting_phase is None:
             # Vectorize over 8 phases
@@ -256,7 +289,6 @@ class ITV_env:
         '''
         Deliver the intended distribution to env
         '''
-        
         left_edges = self.spot_left_edges[:, np.newaxis]
         right_edges = self.spot_right_edges[:, np.newaxis]
     
@@ -282,7 +314,7 @@ class ITV_env:
             
         return np.mean(sq_diffs)
           
-    def calculate_mask_tensor(self, t_step, period, starting_phase = None):
+    def calculate_mask_tensor(self, period, starting_phase = None, mode = '1d'):
         """
         Precomputes all possible spot/time combinations.
     
@@ -294,21 +326,29 @@ class ITV_env:
                 If None: returns 4D Tensor (All Phases, Spots, Time, Voxels)
         """
         
-        self.t_step = t_step
-        
         phase_speed = 2*np.pi/period # Phase of breathing
         
-        # Calculate the latest possible time the simulation can run for
-        # 
-        spot_visits = np.sum(self.spot_weights)
-        t_max = t_max = max(0, (spot_visits - 1) * (self.n_spots - 1))
+        if mode not in self.mode_presets:
+            raise ValueError(f'Mode "{mode}" not recognised. Available: {list(self.mode_presets.keys())}')
         
-        #Create list of times
-        times = (np.arange(t_max + 1) * self.t_step)[np.newaxis, :]
+        self.mode_pen = self.mode_presets.get(mode, 0)
+        
+        # Convert max jump distance to ticks
+        max_jump_ticks = (self.n_spots - 1) * self.t_step_ticks
+        
+        # Compare longest jump to energy layer switch
+        worst_jump_ticks = max(max_jump_ticks, self.mode_pen)
+        
+        # Calculate max possible time in ticks
+        spot_visits = np.sum(self.spot_weights)
+        t_max_ticks = int(max(0, (spot_visits - 1) * worst_jump_ticks))
+        
+        # Convert ticks to seconds for generation physics
+        times = (np.arange(t_max_ticks + 1) * self.tick_time)[np.newaxis, :]
     
-        #Determine phase list from start_phase argument
+        # Determine phase list from start_phase argument
         if starting_phase is None:
-            #Use standard number of phases; here, 8
+            # Use standard number of phases; here, 8
             phases = np.linspace(0, 2*np.pi, 8, endpoint=False)[:, np.newaxis]
         else:
             phases = np.array([starting_phase])[:, np.newaxis]
@@ -328,20 +368,29 @@ class ITV_env:
         #Resulting tensor has dimensions (P,S,T,V)
         self.tensor = (env_space > (left_edges - all_shifts)) & (env_space < (right_edges - all_shifts))
     
-    def evaluate_sequences(self, sequences, weighting = False):
+    def evaluate_sequences(self, sequences, weighting = True):
         """
         Calculates MSE for a batch of sequences.
         Args:
             sequences: Array of sample sequences
             weighting(bool): Determines whether weighted mse or regular mse is used for evaluation
         """
+        # Check if only one sequence is passed in
+        if sequences.ndim == 1:
+            sequences = sequences[np.newaxis, :]
         
         # Calculate physical jump distances
         jumps = np.abs(np.diff(sequences, axis=1))
 
+        # Convert to ticks
+        ticks = jumps * self.t_step_ticks
+
+        # Apply mode penalty
+        ticks[jumps == 0] = self.mode_pen
+
         # Finding the cumulative jump distances as tensor indices
         time_indices = np.zeros(sequences.shape, dtype=int)
-        time_indices[:, 1:] = np.cumsum(jumps, axis=1)
+        time_indices[:, 1:] = np.cumsum(ticks, axis=1)
         
         return _evaluation_core(self.tensor, self.get_intended_dist(), sequences, time_indices, weighting)     
     

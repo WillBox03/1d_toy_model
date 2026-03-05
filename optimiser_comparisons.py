@@ -19,12 +19,12 @@ if __name__ == "__main__":
 
     period = 5
 
-    env = ITV_env(resolution, env_length, n_spots, amp)
+    env = ITV_env(resolution, env_length, n_spots, amp, t_step = t_step)
 
-    env.set_spot_weights('uniform', repaints = 3)
+    env.set_spot_weights('uniform', repaints = 10)
 
     start_time = time.perf_counter()
-    env.calculate_mask_tensor(t_step, period)
+    env.calculate_mask_tensor(period)
     end_time = time.perf_counter()
     duration = end_time - start_time
 
@@ -34,22 +34,25 @@ if __name__ == "__main__":
     
     repeats = 5
     
-    baseline_raster = env.evaluate_sequences(np.array([np.arange(n_spots)]), True)
-    #sequence_ex, mse_ex = opt.run("exhaustive", weighting = True)
-    
-    times = 5
+    baseline_raster_sequence = env.set_sequence('lr_rast')
+    baseline_raster = env.evaluate_sequences(baseline_raster_sequence)
+    #sequence_ex, mse_ex = opt.run("exhaustive", weighting = True) 
+    print(baseline_raster_sequence)
+    print(baseline_raster)
+    times = 4
     
     mse_sa = np.zeros((times, repeats, 2))
     mse_mc = np.zeros((times, repeats, 2))
     mse_h  = np.zeros((times, repeats, 2))
     
-    sa_params = np.array([1100,5600,12000,28000,58000])
-    mc_params = np.array([3500, 18000, 360000, 900000, 1800000])
-    h_params = np.array([[250,4],[900,10],[900,20],[1500,35],[1500,70]])
+    sa_params = np.array([1100,5600,12000,28000])
+    mc_params = np.array([3500, 18000, 360000, 900000])
+    h_params = np.array([[250,4],[900,10],[900,20],[1500,35]])
     
     print("Warming up compilers...")
     opt.run('simanneal', iterations=10, pop_size=2, temp=0.3, final_temp=0.001)
     opt.run('montecarlo', n_samples=10)
+    opt.run('mcghybrid')
     
     for j in range(times):
         for i in range(repeats):
@@ -62,7 +65,7 @@ if __name__ == "__main__":
             
             _, mse_mc[j,i,0] ,mse_mc[j,i,1] = opt.run("montecarlo",n_samples = mc_params[j])
             
-            _, mse_h[j,i,0], mse_h[j,i,1], _ = opt.run("mcghybrid", n_samples = h_params[j,0], generations = h_params[j,1])
+            _, mse_h[j,i,0], mse_h[j,i,1] = opt.run("mcghybrid", n_samples = h_params[j,0], generations = h_params[j,1])
             
             time.sleep(0.2 * (j + 1))
 
