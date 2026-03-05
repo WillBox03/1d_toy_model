@@ -34,8 +34,11 @@ if __name__ == "__main__":
     
     repeats = 5
     
-    baseline_raster = env.evaluate_sequences(np.array([np.arange(n_spots)]), True)
-    #sequence_ex, mse_ex = opt.run("exhaustive", weighting = True)
+    baseline_raster_sequence = env.set_sequence('lr_rast')
+    baseline_raster = env.evaluate_sequences(baseline_raster_sequence)
+    #sequence_ex, mse_ex = opt.run("exhaustive", weighting = True) 
+    print(baseline_raster_sequence)
+    print(baseline_raster)
     
     times = 5
     

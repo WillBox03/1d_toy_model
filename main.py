@@ -17,13 +17,13 @@ amp = 1 #in cm #
 
 env = ITV_env(resolution, env_length, n_spots, amp)
 
-env.set_spot_weights('uniform', repaints = 0) # Uniform weighting
+env.set_spot_weights('uniform', repaints = 3) # Uniform weighting
 
-t_step = 1/9 # in s
+t_step = 0.1 # in s
 
-period = 2 # in s
+period = 5 # in s
 
-starting_phase = 0 # in rads
+starting_phase = None # in rads
 
 lr_rast_dist, lr_rast_wmse = env.sim(t_step, period, 'lr_rast', starting_phase= starting_phase) 
 
@@ -57,17 +57,16 @@ print(f"Tensor mask loaded in {duration:.4f} seconds")
 
 optimiser = SequenceOptimiser(env)
 
-optimal_sequence, optimal_wmse_optimiser = optimiser.run('exhaustive')
+'''optimal_sequence, optimal_wmse_optimiser = optimiser.run('exhaustive')
 optimal_dist, _ = env.sim(t_step, period, optimal_sequence, starting_phase=0.0)
-print(f'Optimal sequence (exhaustive search) is {optimal_sequence}')
+print(f'Optimal sequence (exhaustive search) is {optimal_sequence}')'''
 
-sims = [lr_rast_dist, rl_rast_dist, optimal_dist]
-names = ['Left-to-Right Raster', 'Right-to-Left Raster', 'Optimal Sequence']
+sims = [lr_rast_dist, rl_rast_dist]
+names = ['Left-to-Right Raster', 'Right-to-Left Raster']
 
 print(f"""wmses for a starting phase of 0 are:
       {names[0]}:{lr_rast_wmse}
-      {names[1]}:{rl_rast_wmse}
-      {names[2]}:{optimal_wmse_optimiser}""")
+      {names[1]}:{rl_rast_wmse}""")
 
 '''print(f"""Average wmses for all starting phases:
       {names[0]}:{lr_rast_avg_wmse}

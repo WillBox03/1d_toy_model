@@ -261,6 +261,9 @@ class ITV_env:
             sequences: Array of sample sequences
             weighting(bool): Determines whether weighted mse or regular mse is used for evaluation
         """
+        # Check if only one sequence is passed in
+        if sequences.ndim == 1:
+            sequences = sequences[np.newaxis, :]
         
         n_sequences = sequences.shape[0]
         intended = self.get_intended_dist()
