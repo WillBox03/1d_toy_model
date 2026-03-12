@@ -14,3 +14,6 @@ wheels/
 parameter_analysis.py
 sim_anneal_optimise.py
 hybrid_raster_compare.py
+
+# Folders
+benchmarks

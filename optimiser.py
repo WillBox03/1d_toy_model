@@ -3,7 +3,7 @@ from math import factorial
 from numba import njit, prange
 import time
 
-from ITV_engine import _evaluation_core_single
+from ITV_engine import _evaluation_core_single_thread
 
 @njit(cache = True)
 def _process_sequence(tensor, intended, seq, seq_len, times, weighting, t_step_ticks, mode_pen):
@@ -18,7 +18,7 @@ def _process_sequence(tensor, intended, seq, seq_len, times, weighting, t_step_t
         
         times[s] = times[s-1] + ticks
     # Evaluate sequence    
-    return _evaluation_core_single(tensor, intended, seq, times, weighting)
+    return _evaluation_core_single_thread(tensor, intended, seq, times, weighting)
     
 
 @njit(parallel=True, cache=True)
@@ -318,6 +318,9 @@ class SequenceOptimiser:
                 "Environment Error: Spot weights not set."
                 "You must call 'env.set_spot_weights()' before initialising the optimiser."
             )
+
+        # Collect and crop the intended distribution the match the evaluation region of the tensor
+        self.target_intended = self.env.get_intended_dist()[self.env.tensor_mask]
         
         self.base_sequence = self.env.spots_expanded
         self.seq_len = len(self.base_sequence)
@@ -351,7 +354,7 @@ class SequenceOptimiser:
         print(f"Running Monte Carlo ({n_samples} samples)")
         start_time = time.perf_counter()
         base_seq = self.base_sequence.astype(np.int16)
-        sequences, evals = _numba_mc_core(self.env.tensor, self.env.get_intended_dist(), base_seq, n_samples, weighting, self.t_ticks, self.mode_pen)
+        sequences, evals = _numba_mc_core(self.env.tensor, self.target_intended, base_seq, n_samples, weighting, self.t_ticks, self.mode_pen)
         
         best_idx = np.argmin(evals)
         
@@ -369,7 +372,7 @@ class SequenceOptimiser:
         base_seq = self.base_sequence.astype(np.int16)
         
         # Run exhaustive core
-        best_seqs, best_evals = _exhaustive_core(self.env.tensor, self.env.get_intended_dist(), base_seq, weighting, self.t_ticks, self.mode_pen)
+        best_seqs, best_evals = _exhaustive_core(self.env.tensor, self.target_intended, base_seq, weighting, self.t_ticks, self.mode_pen)
         # Find theglobal best sequence
         best_idx = np.argmin(best_evals)
         
@@ -387,11 +390,11 @@ class SequenceOptimiser:
         # Get initial baseline score
         times = np.zeros(self.seq_len, dtype=np.int16)
 
-        current_mse = _process_sequence(self.env.tensor, self.env.get_intended_dist(), current_seq[0], self.seq_len, times, weighting, self.t_ticks, self.mode_pen)
+        current_mse = _process_sequence(self.env.tensor, self.target_intended, current_seq[0], self.seq_len, times, weighting, self.t_ticks, self.mode_pen)
         
         for i in range(iterations):
             # The Numba core tests all pair swaps in C-memory and returns the absolute best one
-            best_neighbor_seqs, best_neighbor_mses = _local_search_core(self.env.tensor, self.env.get_intended_dist(), current_seq, weighting, self.t_ticks, self.mode_pen)
+            best_neighbor_seqs, best_neighbor_mses = _local_search_core(self.env.tensor, self.target_intended, current_seq, weighting, self.t_ticks, self.mode_pen)
             
             # Did the Numba core find a better sequence?
             if best_neighbor_mses[0] < current_mse:
@@ -405,7 +408,7 @@ class SequenceOptimiser:
         print(f"Greedy Search completed in {duration:.4f}s")
         return current_seq, current_mse
     
-    def simulated_annealing(self, iterations=1000, pop_size = 5, temp=1.0, final_temp = 0.001, n_bins = 10, weighting=True, debug = False):
+    def simulated_annealing(self, iterations=5000, pop_size=10, temp=0.3, final_temp = 0.001, n_bins = 10, weighting=True, debug = False):
         print("Running Simulated Annealing")
         start_time = time.perf_counter()
         
@@ -417,7 +420,7 @@ class SequenceOptimiser:
         c_fact = (final_temp / temp) ** (1.0 / iterations)
     
         # Run SA core
-        best_seqs, best_mses, all_bins, all_walkers, all_accepted = _sa_core(self.env.tensor, self.env.get_intended_dist(), current_seqs, iterations, temp, c_fact, weighting, n_bins, self.t_ticks, self.mode_pen)
+        best_seqs, best_mses, all_bins, all_walkers, all_accepted = _sa_core(self.env.tensor, self.target_intended, current_seqs, iterations, temp, c_fact, weighting, n_bins, self.t_ticks, self.mode_pen)
         
         # FInd global minimum
         best_idx = np.argmin(best_mses)
@@ -451,14 +454,14 @@ class SequenceOptimiser:
         base_seq = self.base_sequence.astype(np.int16)
         
         # 1. Get Initial Seed Population
-        trial_seqs, trial_evals = _numba_mc_core(self.env.tensor, self.env.get_intended_dist(), base_seq, n_samples, weighting, self.t_ticks, self.mode_pen)
+        trial_seqs, trial_evals = _numba_mc_core(self.env.tensor, self.target_intended, base_seq, n_samples, weighting, self.t_ticks, self.mode_pen)
         
         sorted_idx = np.argsort(trial_evals)
         best_seqs = trial_seqs[sorted_idx[:population_size]]
         best_evals = trial_evals[sorted_idx[:population_size]]
         
         # 2. Fire the Mega-Loop
-        final_seq, final_mse = _hybrid_generation_loop(self.env.tensor, self.env.get_intended_dist(), base_seq, best_seqs, best_evals, generations, n_samples, weighting, self.t_ticks, self.mode_pen)
+        final_seq, final_mse = _hybrid_generation_loop(self.env.tensor, self.target_intended, base_seq, best_seqs, best_evals, generations, n_samples, weighting, self.t_ticks, self.mode_pen)
 
         duration = time.perf_counter() - start_time
         print(f"Hybrid Search completed in {duration:.4f}s")

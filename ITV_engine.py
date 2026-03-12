@@ -40,13 +40,13 @@ def _evaluation_core(tensor, intended, sequences, time_indices, weighting):
                     
                 total_sq_diff += sq_diff
                 
-        # Average it out
+        # Average
         evals[i] = total_sq_diff / (n_phases * n_voxels)
         
     return evals
 
 @njit(cache = True)
-def _evaluation_core_single(tensor, intended, seq, time_indices, weighting):
+def _evaluation_core_single_thread(tensor, intended, seq, time_indices, weighting):
     
     n_phases = tensor.shape[0]
     n_voxels = tensor.shape[3]
@@ -80,21 +80,24 @@ class ITV_env:
     '''
     Environment space for the simulation
     '''
-    def __init__(self, res, env_length, n_spots, amp, spot_size = None, t_step = 0.1, t_switch = 0.5):
+    def __init__(self, res, ctv_length, n_spots, amp, spot_size = None, t_step = 0.1, t_switch = 0.5, margin = None):
         '''
         Initialises the environment, creating a high resolution coordinate space for the env of set length. Also defines positions of proton beam spots covering the ITV
         Args:
             res (float): Resolution of environment, in cm
-            env_length (float,int): Length of env, in cm
+            ctv_length (float,int): Length of env, in cm
             n_spots (int): Number of proton beam spots covering the ITV
             amp(float): Amplitude of breathing motion, in cm
             spot_size (float): Physical width of spot in cm
         '''
         
         if spot_size is None:
-            spot_size = (env_length + (2*amp)) / n_spots
+            spot_size = (ctv_length + (2*amp)) / n_spots
+            
+        if margin is None:
+            margin = amp
         
-        self.update_env(res=res, env_length=env_length, amp=amp, n_spots=n_spots, spot_size=spot_size, t_step=t_step, t_switch=t_switch)
+        self.update_env(res=res, ctv_length=ctv_length, amp=amp, n_spots=n_spots, spot_size=spot_size, t_step=t_step, t_switch=t_switch, margin=margin)
         
         # Convert seconds to integers
         multiplier = 100000 # Correct for floating point errors
@@ -121,21 +124,26 @@ class ITV_env:
         '''
         
         if 'res' in kwargs: self.res = kwargs['res']
-        if 'env_length' in kwargs: self.env_length = kwargs['env_length']
+        if 'ctv_length' in kwargs: self.ctv_length = kwargs['ctv_length']
         if 'amp' in kwargs: self.amp = kwargs['amp']
         if 'n_spots' in kwargs: self.n_spots = kwargs['n_spots']
         if 'spot_size' in kwargs: self.spot_size = kwargs['spot_size']
         if 't_step' in kwargs: self.t_step = kwargs['t_step']
         if 't_switch' in kwargs: self.t_switch = kwargs['t_switch']
+        if 'margin' in kwargs: self.margin = kwargs['margin']
         
         # Boundaries of env and ITV
-        self.env_half_length = self.env_length / 2
-        self.itv_extent = self.env_half_length + self.amp
+        self.ctv_half_length = self.ctv_length / 2
+        self.itv_extent = self.ctv_half_length + self.amp
         
-        self.n_env_voxels = int(np.round(self.env_length / self.res)) # Calculate number of voxels used in env
+        # Extent of environment, including a margin around the ITV
+        self.total_env_half_length = self.itv_extent + self.margin
+        self.total_env_length = 2 * self.total_env_half_length
+        
+        self.n_env_voxels = int(np.round(self.total_env_length / self.res)) # Calculate number of voxels used in env
         
         # Create hi-res env environment at voxel centres
-        self.env_space = np.linspace(-self.env_half_length + self.res/2, self.env_half_length - self.res/2, self.n_env_voxels)
+        self.env_space = np.linspace(-self.total_env_half_length + self.res/2, self.total_env_half_length - self.res/2, self.n_env_voxels)
         
         total_itv_width = 2 * self.itv_extent
         total_spot_width = self.n_spots * self.spot_size
@@ -204,12 +212,29 @@ class ITV_env:
             
         def find_max_dist():
             
-            if self.n_spots % 2 == 0:
-                sequence =  np.roll(np.ravel((np.arange(self.n_spots//2),np.arange(self.n_spots-1, self.n_spots//2 - 1, -1)), order="F"),1)
-            else:
-                sequence = np.concatenate((np.array([self.n_spots//2]),np.ravel((np.arange(self.n_spots//2),np.arange(self.n_spots-1, self.n_spots//2, -1)), order="F")))
+            A = np.sort(self.spots_expanded)
+            N = len(A)
+            half = N // 2
+            
+            if N % 2 == 0:
+                lower = A[:half]
+                upper = A[half:][::-1] 
                 
-            return np.tile(sequence, self.passes)
+                seq = np.empty(N, dtype=A.dtype)
+                seq[0::2] = lower
+                seq[1::2] = upper
+                
+                return np.roll(seq, 1)
+            else:
+                lower = A[:half]
+                upper = A[half+1:][::-1]
+                mid = A[half]
+                
+                seq = np.empty(N-1, dtype=A.dtype)
+                seq[0::2] = lower
+                seq[1::2] = upper
+                
+                return np.concatenate((np.array([mid]), np.roll(seq, 1)))
             
         presets = {'lr_rast' : raster_repaint(bidirectional),
                     'rl_rast' : raster_repaint(bidirectional)[::-1],
@@ -225,7 +250,7 @@ class ITV_env:
 
         return sequence
 
-    def sim(self, period, sequence, starting_phase = None, weighting = True, mode = '1d'):
+    def sim(self, period, sequence, starting_phase = None, phases = 8, weighting = True, mode = '1d', region = 'ctv'):
         
         '''
         Simulates spot scanning sequence in a moving target, returning the resultant dose distribution
@@ -257,8 +282,8 @@ class ITV_env:
         times = cumulative_ticks * self.tick_time
         
         if starting_phase is None:
-            # Vectorize over 8 phases
-            phases = np.linspace(0, 2*np.pi, 8, endpoint=False)[:, np.newaxis]
+            # Vectorize over selected phases
+            phases = np.linspace(0, 2*np.pi, phases, endpoint=False)[:, np.newaxis]
         else:
             # Simulate just the single specified phase
             phases = np.array([starting_phase])[:, np.newaxis]
@@ -281,7 +306,7 @@ class ITV_env:
         
         dose_dist = dose_dist if starting_phase is None else dose_dist[0]
         
-        error = self.calc_error(dose_dist, weighting = weighting)
+        error = self.calc_error(dose_dist, weighting = weighting, region = region)
 
         return dose_dist, error   
 
@@ -296,16 +321,33 @@ class ITV_env:
         
         return spot_masks.T @ self.spot_weights
     
-    def calc_error(self, dose_dist, weighting = True):
+    def calc_error(self, dose_dist, weighting = True, region = 'ctv'):
         '''
         Calculates the error of a resultant dose distribution against the intended distribution.
         If weighting=True, applies a penalty (x5) to underdosed voxels (WMSE).
         Otherwise, returns standard MSE.
         '''
+        
+        # Check which region is evaluated and mask:
+        if region == 'ctv':
+            region_mask = (self.env_space >= -self.ctv_half_length) & (self.env_space <= self.ctv_half_length)
+        elif region == 'itv':
+            region_mask = (self.env_space >= -self.itv_extent) & (self.env_space <= self.itv_extent)
+        else:
+            raise ValueError("Region must be 'ctv' or 'itv'")
+        
+        # Check for starting phase and applies mask
+        if dose_dist.ndim == 1:
+            region_dose = dose_dist[region_mask]
+        else:
+            region_dose = dose_dist[:, region_mask]
+        
         intended_dist = self.get_intended_dist()
         
+        intended_dose= intended_dist[region_mask]
+        
         # Calculate raw differences
-        diffs = dose_dist - intended_dist
+        diffs = region_dose - intended_dose
         sq_diffs = diffs**2
         
         # Apply penalty to negative differences (underdosing) if weighting is on
@@ -314,7 +356,7 @@ class ITV_env:
             
         return np.mean(sq_diffs)
           
-    def calculate_mask_tensor(self, period, starting_phase = None, mode = '1d'):
+    def calculate_mask_tensor(self, period, starting_phase = None, phases = 8, mode = '1d', region = 'ctv'):
         """
         Precomputes all possible spot/time combinations.
     
@@ -348,8 +390,8 @@ class ITV_env:
     
         # Determine phase list from start_phase argument
         if starting_phase is None:
-            # Use standard number of phases; here, 8
-            phases = np.linspace(0, 2*np.pi, 8, endpoint=False)[:, np.newaxis]
+            # Use standard number of phases
+            phases = np.linspace(0, 2*np.pi, phases, endpoint=False)[:, np.newaxis]
         else:
             phases = np.array([starting_phase])[:, np.newaxis]
             
@@ -361,8 +403,18 @@ class ITV_env:
         left_edges = self.spot_left_edges[np.newaxis, :, np.newaxis, np.newaxis]
         right_edges = self.spot_right_edges[np.newaxis, :, np.newaxis, np.newaxis]
         
+        # Define mask based on evaluation region
+        if region.lower() == 'ctv':
+            self.tensor_mask = (self.env_space >= -self.ctv_half_length) & (self.env_space <= self.ctv_half_length)
+        elif region.lower() == 'itv':
+            self.tensor_mask = (self.env_space >= -self.itv_extent) & (self.env_space <= self.itv_extent)
+        else:
+            raise ValueError("Region must be 'ctv' or 'itv'")
+        
+        target_env_space = self.env_space[self.tensor_mask]
+        
         #Reshape env space to (1,1,1,V)
-        env_space = self.env_space[np.newaxis, np.newaxis, np.newaxis, :]
+        env_space = target_env_space[np.newaxis, np.newaxis, np.newaxis, :]
 
         #Generate the masks for all phases, for all spots, for all time steps
         #Resulting tensor has dimensions (P,S,T,V)
@@ -392,14 +444,20 @@ class ITV_env:
         time_indices = np.zeros(sequences.shape, dtype=int)
         time_indices[:, 1:] = np.cumsum(ticks, axis=1)
         
-        return _evaluation_core(self.tensor, self.get_intended_dist(), sequences, time_indices, weighting)     
+        intended_mask = self.get_intended_dist()[self.tensor_mask]
+        
+        return _evaluation_core(self.tensor, intended_mask, sequences, time_indices, weighting)     
     
-    def display_sims(self, sims, labels = None):
+    def display(self, sims, labels = None, avg_phases = False):
         '''
         Generate and display the intended target distribution, along with other simulated distributions
         '''
         
         target_dist = self.get_intended_dist()
+        
+        ctv_intended = np.zeros_like(self.env_space)
+        ctv_mask = (self.env_space >= -self.ctv_half_length) & (self.env_space <= self.ctv_half_length)
+        ctv_intended[ctv_mask] = np.max(target_dist)
                 
         for i, sim in enumerate(sims):
             #Assign label if it exists
@@ -407,14 +465,26 @@ class ITV_env:
                 sim_label = labels[i]
             else:
                 sim_label = f'Simulated Distribution {i+1}'
-                
-            plt.plot(self.env_space, sim, lw=2, alpha= 0.9, label = sim_label)
+            if sim.ndim == 1:
+                plt.plot(self.env_space, sim, lw = 2, alpha = 0.9, label = sim_label)
+            else:
+                if avg_phases:
+                    # Average phases distributions if needed
+                    avg_dist = np.mean(sim, axis = 0)
+                    plt.plot(self.env_space, avg_dist, lw = 2, alpha = 0.9, label = sim_label)
+                else:
+                    for j, dist in enumerate(sim):
+                        current_label = sim_label if j == 0 else '_nolegend_'
+                        
+                        plt.plot(self.env_space, dist, lw = 2, alpha = 0.9, label = current_label)
             
-        plt.plot(self.env_space, target_dist, 'k--', lw=2, label = "Intended Dose Distribution")
+        plt.plot(self.env_space, target_dist, 'k--', lw=2, label = "Intended Dose (ITV)")
+        plt.plot(self.env_space, ctv_intended, 'r:', lw=2, label = "CTV")   
             
         plt.ylabel('Relative Dose (Times Visited)')
         plt.xlabel('Position on env (cm)')
         plt.grid(True)
         
-        plt.legend()
+        plt.legend(loc='upper left', bbox_to_anchor=(1.02, 1), borderaxespad=0, frameon=True)
+        plt.tight_layout()
         plt.show()
