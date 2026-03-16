@@ -76,6 +76,39 @@ def _evaluation_core_single_thread(tensor, intended, seq, time_indices, weightin
             total_sq_diff += sq_diff
             
     return total_sq_diff / (n_phases * n_voxels)
+
+def find_max_dist(spots_expanded):
+            '''
+            Returns the maxiumum distance/time sequence
+            Starts with the centre spot, then jumps to the furthest spot away until all spots have been met
+            '''
+            A = np.sort(spots_expanded) # Sort spot positions
+            N = len(A)
+            half = N // 2
+            
+            if N % 2 == 0:
+                # If number of spots is even, split into equal arrays
+                lower = A[:half]
+                upper = A[half:][::-1] 
+                
+                # Interleave sequence with spots from alternating arrays
+                seq = np.empty(N, dtype=A.dtype)
+                seq[0::2] = lower
+                seq[1::2] = upper
+                
+                return np.roll(seq, 1) # Start with the middle spot
+            else:
+                # If number of spots is odd, extract centre spot
+                lower = A[:half]
+                upper = A[half+1:][::-1]
+                mid = A[half]
+                
+                seq = np.empty(N-1, dtype=A.dtype)
+                seq[0::2] = lower
+                seq[1::2] = upper
+                
+                return np.concatenate((np.array([mid]), np.roll(seq, 1))) # Add spot to the front at the end
+            
 class ITV_env:   
     '''
     Environment space for the simulation
@@ -210,36 +243,10 @@ class ITV_env:
             sequence = [single_raster if i % 2 == 0 else single_raster[::-1] for i in range(self.passes)]
             return np.concatenate(sequence)
             
-        def find_max_dist():
-            
-            A = np.sort(self.spots_expanded)
-            N = len(A)
-            half = N // 2
-            
-            if N % 2 == 0:
-                lower = A[:half]
-                upper = A[half:][::-1] 
-                
-                seq = np.empty(N, dtype=A.dtype)
-                seq[0::2] = lower
-                seq[1::2] = upper
-                
-                return np.roll(seq, 1)
-            else:
-                lower = A[:half]
-                upper = A[half+1:][::-1]
-                mid = A[half]
-                
-                seq = np.empty(N-1, dtype=A.dtype)
-                seq[0::2] = lower
-                seq[1::2] = upper
-                
-                return np.concatenate((np.array([mid]), np.roll(seq, 1)))
-            
         presets = {'lr_rast' : raster_repaint(bidirectional),
                     'rl_rast' : raster_repaint(bidirectional)[::-1],
                     'rand' : np.random.permutation(self.spots_expanded),
-                    'max_dist': find_max_dist()
+                    'max_dist': find_max_dist(self.spots_expanded)
         }
         
         if isinstance(sequence, str):
@@ -250,7 +257,7 @@ class ITV_env:
 
         return sequence
 
-    def sim(self, period, sequence, starting_phase = None, phases = 8, weighting = True, mode = '1d', region = 'ctv'):
+    def sim(self, period, sequence, starting_phase = None, n_phases = 8, weighting = True, mode = '1d', region = 'ctv'):
         
         '''
         Simulates spot scanning sequence in a moving target, returning the resultant dose distribution
@@ -283,7 +290,7 @@ class ITV_env:
         
         if starting_phase is None:
             # Vectorize over selected phases
-            phases = np.linspace(0, 2*np.pi, phases, endpoint=False)[:, np.newaxis]
+            phases = np.linspace(0, 2*np.pi, n_phases, endpoint=False)[:, np.newaxis]
         else:
             # Simulate just the single specified phase
             phases = np.array([starting_phase])[:, np.newaxis]
@@ -337,10 +344,8 @@ class ITV_env:
             raise ValueError("Region must be 'ctv' or 'itv'")
         
         # Check for starting phase and applies mask
-        if dose_dist.ndim == 1:
-            region_dose = dose_dist[region_mask]
-        else:
-            region_dose = dose_dist[:, region_mask]
+        # Check for starting phase and apply mask
+        region_dose = dose_dist[region_mask] if dose_dist.ndim == 1 else dose_dist[:, region_mask]
         
         intended_dist = self.get_intended_dist()
         
@@ -356,7 +361,7 @@ class ITV_env:
             
         return np.mean(sq_diffs)
           
-    def calculate_mask_tensor(self, period, starting_phase = None, phases = 8, mode = '1d', region = 'ctv'):
+    def calculate_mask_tensor(self, period, starting_phase = None, n_phases = 8, mode = '1d', region = 'ctv'):
         """
         Precomputes all possible spot/time combinations.
     
@@ -391,7 +396,7 @@ class ITV_env:
         # Determine phase list from start_phase argument
         if starting_phase is None:
             # Use standard number of phases
-            phases = np.linspace(0, 2*np.pi, phases, endpoint=False)[:, np.newaxis]
+            phases = np.linspace(0, 2*np.pi, n_phases, endpoint=False)[:, np.newaxis]
         else:
             phases = np.array([starting_phase])[:, np.newaxis]
             
@@ -446,9 +451,9 @@ class ITV_env:
         
         intended_mask = self.get_intended_dist()[self.tensor_mask]
         
-        return _evaluation_core(self.tensor, intended_mask, sequences, time_indices, weighting)     
+        return _evaluation_core(self.tensor, intended_mask, sequences, time_indices, weighting)
     
-    def display(self, sims, labels = None, avg_phases = False):
+    def display(self, sims = None, labels = None, avg_phases = False, spot_edges = False):
         '''
         Generate and display the intended target distribution, along with other simulated distributions
         '''
@@ -458,33 +463,476 @@ class ITV_env:
         ctv_intended = np.zeros_like(self.env_space)
         ctv_mask = (self.env_space >= -self.ctv_half_length) & (self.env_space <= self.ctv_half_length)
         ctv_intended[ctv_mask] = np.max(target_dist)
-                
-        for i, sim in enumerate(sims):
-            #Assign label if it exists
-            if labels is not None and i < len(labels):
-                sim_label = labels[i]
-            else:
-                sim_label = f'Simulated Distribution {i+1}'
-            if sim.ndim == 1:
-                plt.plot(self.env_space, sim, lw = 2, alpha = 0.9, label = sim_label)
-            else:
-                if avg_phases:
-                    # Average phases distributions if needed
-                    avg_dist = np.mean(sim, axis = 0)
-                    plt.plot(self.env_space, avg_dist, lw = 2, alpha = 0.9, label = sim_label)
+        
+        if sims is not None:
+            for i, sim in enumerate(sims):
+                #Assign label if it exists
+                if labels is not None and i < len(labels):
+                    sim_label = labels[i]
                 else:
-                    for j, dist in enumerate(sim):
-                        current_label = sim_label if j == 0 else '_nolegend_'
-                        
-                        plt.plot(self.env_space, dist, lw = 2, alpha = 0.9, label = current_label)
+                    sim_label = f'Simulated Distribution {i+1}'
+                if sim.ndim == 1:
+                    plt.plot(self.env_space, sim, lw = 2, alpha = 0.9, label = sim_label)
+                else:
+                    if avg_phases:
+                        # Average phases distributions if needed
+                        avg_dist = np.mean(sim, axis = 0)
+                        plt.plot(self.env_space, avg_dist, lw = 2, alpha = 0.9, label = sim_label)
+                    else:
+                        for j, dist in enumerate(sim):
+                            current_label = sim_label if j == 0 else '_nolegend_'
+                            
+                            plt.plot(self.env_space, dist, lw = 2, alpha = 0.9, label = current_label)
             
         plt.plot(self.env_space, target_dist, 'k--', lw=2, label = "Intended Dose (ITV)")
-        plt.plot(self.env_space, ctv_intended, 'r:', lw=2, label = "CTV")   
-            
+        plt.plot(self.env_space, ctv_intended, 'r:', lw=2, label = "CTV") 
+        
+        if spot_edges:
+            plt.axvline(self.spot_left_edges[0], color='blue', linestyle='--', linewidth=1, label='Spot Edges')
+            plt.axvline(self.spot_right_edges[0], color='blue', linestyle='--', linewidth=1)
+            for i in range(1, len(self.spot_left_edges)):
+                plt.axvline(self.spot_left_edges[i], color='blue', linestyle='--', linewidth=1)
+                plt.axvline(self.spot_right_edges[i], color='blue', linestyle='--', linewidth=1)
+        
+        plt.title('Dose Distribution in 1D')
         plt.ylabel('Relative Dose (Times Visited)')
         plt.xlabel('Position on env (cm)')
         plt.grid(True)
         
         plt.legend(loc='upper left', bbox_to_anchor=(1.02, 1), borderaxespad=0, frameon=True)
+        plt.tight_layout()
+        plt.show()
+        
+        
+        
+        
+
+class ITV_env_2D:
+    '''
+    Environment space for the simulation in 2D
+    '''
+    def __init__(self, ctv_size, n_spots, amp, res = 0.1 , spot_size = None, t_steps = (0.1,0.1), margin = None):
+        '''
+        Initialises the environment, creating a high resolution coordinate space for the env of set length. Also defines positions of proton beam spots covering the ITV
+        Args:
+            res (float): Resolution of environment, in cm
+            ctv_size (tuple, float): Dimensions of CTV in x and y, in cm
+            n_spots (tuple, int): Number of proton beam spots covering the ITV in x and y dims
+            amp(float): Amplitude of breathing motion in both x and y dims, in cm
+            spot_size (float, float/None): Physical width of spot in cm
+            t_steps (tuple, float): Time taken for proton beam to move to adjacent spots, in x and y dims, in s
+            margin(tuple, float): Space between edge of ITV and edge of simulation in x and y dims
+        '''
+        
+        if spot_size is None:
+            spot_size = tuple((np.array(ctv_size) + (2 * np.array(amp))) / np.array(n_spots))
+            
+        if margin is None:
+            margin = amp
+        
+        self.update_env(res=res, ctv_size=ctv_size, amp=amp, n_spots=n_spots, spot_size=spot_size, t_steps=t_steps, margin=margin)
+                
+    def update_env(self, **kwargs):
+        '''
+        Update the number of proton spots and the oscillation amplitude without initialising a new object
+        '''
+        
+        if 'res' in kwargs: self.res = kwargs['res']
+        if 'ctv_size' in kwargs: self.ctv_size = kwargs['ctv_size']
+        if 'amp' in kwargs: self.amp = kwargs['amp']
+        if 'n_spots' in kwargs: self.n_spots = kwargs['n_spots']
+        if 'spot_size' in kwargs: self.spot_size = kwargs['spot_size']
+        if 't_steps' in kwargs: self.t_steps = kwargs['t_steps']
+        if 'margin' in kwargs: self.margin = kwargs['margin']
+        
+        self.n_spots_tot = self.n_spots[0] * self.n_spots[1] # Total spot number
+        
+        # Unpack CTV size, amplitude and margins
+        self.ctv_half_x, self.ctv_half_y = self.ctv_size[0] / 2, self.ctv_size[1] / 2
+        self.amp_x, self.amp_y = self.amp
+        self.margin_x, self.margin_y = self.margin
+        
+        # Boundaries of ITV, and lengths of the environment
+        self.itv_extent_x = self.ctv_half_x + self.amp_x
+        self.itv_extent_y = self.ctv_half_y + self.amp_y
+        
+        self.total_env_half_x = self.itv_extent_x + self.margin_x
+        self.total_env_half_y = self.itv_extent_y + self.margin_y
+        
+        # Determine environment grid size
+        self.n_voxels_x = int(np.round((2 * self.total_env_half_x) / self.res))
+        self.n_voxels_y = int(np.round((2 * self.total_env_half_y) / self.res))
+        
+        ## Create 2D coordinate space
+        x_axis = np.linspace(-self.total_env_half_x + self.res/2, self.total_env_half_x - self.res/2, self.n_voxels_x)
+        y_axis = np.linspace(-self.total_env_half_y + self.res/2, self.total_env_half_y - self.res/2, self.n_voxels_y)
+        X, Y = np.meshgrid(x_axis, y_axis)        
+        
+        # Flatten for calculations
+        self.env_space_x = X.flatten()
+        self.env_space_y = Y.flatten()
+        self.n_env_voxels = len(self.env_space_x) # Number of voxels in env
+        
+        # Unpack spot centres,m list and flatten into arrays
+        spot_size_x, spot_size_y = self.spot_size
+        spot_axis_x = np.linspace(-self.itv_extent_x + spot_size_x/2, self.itv_extent_x - spot_size_x/2, self.n_spots[0])
+        spot_axis_y = np.linspace(-self.itv_extent_y + spot_size_y/2, self.itv_extent_y - spot_size_y/2, self.n_spots[1])
+        SX, SY = np.meshgrid(spot_axis_x, spot_axis_y)
+        self.spot_centres_x = SX.flatten()
+        self.spot_centres_y = SY.flatten()
+        
+        # Define proton spot edges in environment
+        self.spot_left = self.spot_centres_x - spot_size_x / 2
+        self.spot_right = self.spot_centres_x + spot_size_x / 2
+        self.spot_bottom = self.spot_centres_y - spot_size_y / 2
+        self.spot_top = self.spot_centres_y + spot_size_y / 2
+        
+        
+        
+        # Calculating engine time constants
+        multiplier = 100000 # Correct for floating point errors
+        int_step_x = int(np.round(self.t_steps[0] * multiplier))
+        int_step_y = int(np.round(self.t_steps[1] * multiplier))
+        
+        # Find the greatest common divisor to get the engine tick time
+        gcd_val = math.gcd(int_step_x, int_step_y)
+        self.tick_time = gcd_val / multiplier
+        
+        # Update tick counts
+        self.t_step_ticks_x = int(np.round(self.t_steps[0] / self.tick_time))
+        self.t_step_ticks_y = int(np.round(self.t_steps[1] / self.tick_time))
+
+        # Define empty attributes for spot weights and dose distribution
+        self.spot_weights = np.zeros(self.n_spots_tot, dtype=int)
+        self.passes = 1
+        self.spots_expanded = np.arange(self.n_spots_tot)
+
+    def set_spot_weights(self, spot_weights, repaints = 0):
+        '''
+        Defines the dosage weighting for each spot, only accepts uniform as preset currently
+        '''
+        self.passes = repaints + 1
+        
+        self.passes = repaints + 1
+        if spot_weights == 'uniform':
+            self.spot_weights = np.ones(self.n_spots_tot, dtype=int)
+        elif len(spot_weights) != self.n_spots_tot:
+            raise ValueError(f'Length of custom spot_weights argument ({len(spot_weights)}), does not equal the number of spots ({self.n_spots_tot}).')
+        else:
+            self.spot_weights = np.array(spot_weights, dtype=int)
+            
+        self.spot_weights *= self.passes
+        self.spots_expanded = np.repeat(np.arange(self.n_spots_tot), self.spot_weights)
+    
+    def set_sequence(self, sequence = 'raster', bidirectional = False):
+        '''
+        Defines the ordering sequence of the spots, with some preset order selections
+        '''
+        
+        def raster_repaint(bidirectional = True):
+            
+            nx = self.n_spots[0]
+            ny = self.n_spots[1]
+            
+            # Create a 2D grid of the spot numbers
+            grid = np.arange(self.n_spots_tot).reshape(ny, nx)
+            
+            # Flip every second row
+            for i in range(1, ny, 2):
+                grid[i] = grid[i, ::-1]
+            
+            # Flatten it back to 1D
+            single_rast = grid.flatten()
+            
+            # If bidirectional is False,m repeat the same snake [0...99, 0...99]
+            if not bidirectional:
+                return np.tile(single_rast, self.passes)
+            
+            # Otherwise, paint back up [0...99, 99...0]
+            full_seq = [single_rast if i % 2 == 0 else single_rast[::-1] for i in range(self.passes)]
+            return np.concatenate(full_seq)
+        
+        presets = {'lr_rast' : raster_repaint(bidirectional),
+                    'rl_rast' : raster_repaint(bidirectional)[::-1],
+                    'max_dist': find_max_dist(self.spots_expanded),
+                    'rand' : np.random.permutation(self.spots_expanded),
+        }
+        
+        if isinstance(sequence, str):
+            if sequence in presets:
+                return presets[sequence]
+            else:
+                raise ValueError(f"Unknown preset: '{sequence}'. Available: {list(presets.keys())}")  
+        return sequence
+
+    def sim(self, period, sequence, starting_phase = None, n_phases = 4, weighting = True, region = 'ctv'):
+        
+        '''
+        Simulates spot scanning sequence in a moving target, returning the resultant dose distribution
+        Args:
+            t_step (float): Time taken for proton beam to move to adjacent spots, in s
+            period (float): Period of breathing motion, in s
+            sequence (arr, str): Sequence for proton beam spots
+        '''
+        
+        sequence = self.set_sequence(sequence)
+        
+        phase = 2*np.pi/period # Phase of breathing
+        
+        nx = self.n_spots[0] # Number of columns in spot grid
+        
+        # Decode spot sequence into row and columns
+        cols = sequence % nx
+        rows = sequence // nx
+        
+        # Calculate grid distance traveled in X and Y
+        jumps_x = np.abs(cols[1:] - cols[:-1])
+        jumps_y = np.abs(rows[1:] - rows[:-1])
+        
+        # Convert distances to ticks
+        ticks_x = jumps_x * self.t_step_ticks_x
+        ticks_y = jumps_y * self.t_step_ticks_y
+        
+        # Add ticks in both dimensions to get total tick time of jump using Manhatten distance
+        ticks = ticks_x + ticks_y
+        
+        # Accumulate the integers ticks
+        cumulative_ticks = np.zeros(len(sequence), dtype=int)
+        cumulative_ticks[1:] = np.cumsum(ticks)
+        
+        # Convert ticks to seconds for physical calculations
+        times = cumulative_ticks * self.tick_time
+        
+        if starting_phase is None:
+            # Vectorize over selected phases
+            phases = np.linspace(0, 2*np.pi, n_phases, endpoint=False)[:, np.newaxis]
+        else:
+            # Simulate just the single specified phase
+            phases = np.array([starting_phase])[:, np.newaxis]
+
+        # Resultant positional shifts in x and y
+        shifts_x = self.amp_x * np.sin((phase*times) + phases) 
+        shifts_y = self.amp_y * np.sin((phase*times) + phases)
+
+        # Find the spot edges in sequence order and apply time spatial shifts in x and y
+        left_shifts = (self.spot_left[sequence] - shifts_x)[:, :, np.newaxis]
+        right_shifts = (self.spot_right[sequence] - shifts_x)[:, :, np.newaxis]
+        bottom_shifts = (self.spot_bottom[sequence] - shifts_y)[:, :, np.newaxis]
+        top_shifts = (self.spot_top[sequence] - shifts_y)[:, :, np.newaxis]
+        
+        # Mask for proton spots over the env
+        mask_x = (self.env_space_x > left_shifts) & (self.env_space_x < right_shifts)
+        mask_y = (self.env_space_y > bottom_shifts) & (self.env_space_y < top_shifts)
+        spot_masks = mask_x & mask_y
+
+        # Add dose of 1 at every part of env space visited by a proton spot
+        dose_dist = np.sum(spot_masks, axis = 1)
+        
+        dose_dist = dose_dist if starting_phase is None else dose_dist[0] # Array fix for a starting phase
+        
+        error = self.calc_error(dose_dist, weighting = weighting, region = region) # Calculate the error function of sim
+
+        return dose_dist, error   
+
+    def get_intended_dist(self):
+        '''
+        Deliver the intended distribution to env
+        '''
+        
+        # Collect spot edges
+        left_edges = self.spot_left[:, np.newaxis]
+        right_edges = self.spot_right[:, np.newaxis]
+        bottom_edges = self.spot_bottom[:, np.newaxis]
+        top_edges = self.spot_top[:, np.newaxis]
+
+        # Generate spot regions using masks
+        mask_x = (self.env_space_x > left_edges) & (self.env_space_x < right_edges)
+        mask_y = (self.env_space_y > bottom_edges) & (self.env_space_y < top_edges)
+        spot_masks = mask_x & mask_y
+        
+        return spot_masks.T @ self.spot_weights # Apply required dose to each spot
+    
+    def calc_error(self, dose_dist, weighting = True, region = 'ctv'):
+        '''
+        Calculates the error of a resultant dose distribution against the intended distribution.
+        If weighting=True, applies a penalty (x5) to underdosed voxels (WMSE).
+        Otherwise, returns standard MSE.
+        '''
+        
+        # Check which region is evaluated and mask:
+        if region == 'ctv':
+            region_mask = (np.abs(self.env_space_x) <= self.ctv_half_x) & (np.abs(self.env_space_y) <= self.ctv_half_y)
+        elif region == 'itv':
+            region_mask = (np.abs(self.env_space_x) <= self.itv_extent_x) & (np.abs(self.env_space_y) <= self.itv_extent_y)
+        else:
+            raise ValueError("Region must be 'ctv' or 'itv'")
+        
+        # Check for starting phase and apply mask
+        region_dose = dose_dist[region_mask] if dose_dist.ndim == 1 else dose_dist[:, region_mask]
+        
+        # Collect intended distributed in required region
+        intended_dist = self.get_intended_dist()
+        intended_dose= intended_dist[region_mask]
+        
+        # Calculate raw differences
+        diffs = region_dose - intended_dose
+        sq_diffs = diffs**2
+        
+        # Apply penalty to negative differences (underdosing) if weighting is on
+        if weighting:
+            sq_diffs[diffs < 0] *= 5
+            
+        return np.mean(sq_diffs)
+          
+    def calculate_mask_tensor(self, period, starting_phase = None, n_phases = 4, region = 'ctv'):
+        """
+        Precomputes all possible spot/time combinations.
+    
+        Args:
+            timestep (float): Time per jump unit.
+            period (float): Breathing period.
+            starting_phase (float/None): 
+                If float: returns 3D Tensor (Spots, Time, Voxels)
+                If None: returns 4D Tensor (All Phases, Spots, Time, Voxels)
+        """
+        
+        phase_speed = 2*np.pi/period # Phase of breathing
+        
+        # Generate the row anmd column value of each required spot
+        nx = self.n_spots[0]
+        cols = self.spots_expanded % nx
+        rows = self.spots_expanded // nx
+        
+        # Find the max path in each dimension
+        max_path_x = 2 * np.sum(np.abs(cols - np.median(cols)))
+        max_path_y = 2 * np.sum(np.abs(rows - np.median(rows)))
+        
+        # Convert to ticks
+        worst_ticks_x = max_path_x * self.t_step_ticks_x
+        worst_ticks_y = max_path_y * self.t_step_ticks_y
+        
+        # Add worst cases for maximum time
+        t_max_ticks = int(worst_ticks_x + worst_ticks_y)
+        
+        # Convert to secs
+        times = (np.arange(t_max_ticks + 1) * self.tick_time)[np.newaxis, :]
+    
+        # Determine phase list from start_phase argument
+        if starting_phase is None:
+            # Use standard number of phases
+            phases = np.linspace(0, 2*np.pi, n_phases, endpoint=False)[:, np.newaxis]
+        else:
+            phases = np.array([starting_phase])[:, np.newaxis]
+            
+        #Create 4D tensor, currently filled with the phase shifts at each timepoint with each starting phase
+        #Dimensions (P,1,T,1)
+        shifts_x = (self.amp_x * np.sin((phase_speed * times) + phases))[:, np.newaxis, :, np.newaxis]
+        shifts_y = (self.amp_y * np.sin((phase_speed * times) + phases))[:, np.newaxis, :, np.newaxis]
+
+        #Find the spot edges for (1, S, 1, 1)
+        l_edges = self.spot_left[np.newaxis, :, np.newaxis, np.newaxis]
+        r_edges = self.spot_right[np.newaxis, :, np.newaxis, np.newaxis]
+        b_edges = self.spot_bottom[np.newaxis, :, np.newaxis, np.newaxis]
+        t_edges = self.spot_top[np.newaxis, :, np.newaxis, np.newaxis]
+        
+        # Define mask based on evaluation region
+        if region.lower() == 'ctv':
+            self.tensor_mask = (np.abs(self.env_space_x) <= self.ctv_half_x) & \
+                               (np.abs(self.env_space_y) <= self.ctv_half_y)
+        elif region.lower() == 'itv':
+            self.tensor_mask = (np.abs(self.env_space_x) <= self.itv_extent_x) & \
+                               (np.abs(self.env_space_y) <= self.itv_extent_y)
+        else:
+            raise ValueError("Region must be 'ctv' or 'itv'")
+        
+        # Target voxel coordinates in environment space in (1,1,1,V)
+        target_x = self.env_space_x[self.tensor_mask][np.newaxis, np.newaxis, np.newaxis, :]
+        target_y = self.env_space_y[self.tensor_mask][np.newaxis, np.newaxis, np.newaxis, :]
+
+        # Check if target voxel is within X-bounds AND Y-bounds simultaneously
+        mask_x = (target_x > (l_edges - shifts_x)) & (target_x < (r_edges - shifts_x))
+        mask_y = (target_y > (b_edges - shifts_y)) & (target_y < (t_edges - shifts_y))
+        
+        #Generate the masks for all phases, for all spots, for all time steps
+        #Resulting tensor has dimensions (P,S,T,V)
+        self.tensor = (mask_x & mask_y).astype(np.bool_)
+    
+    def evaluate_sequences(self, sequences, weighting = True):
+        """
+        Calculates MSE for a batch of sequences.
+        Args:
+            sequences: Array of sample sequences
+            weighting(bool): Determines whether weighted mse or regular mse is used for evaluation
+        """
+        # Check if only one sequence is passed in
+        if sequences.ndim == 1:
+            sequences = sequences[np.newaxis, :]
+        
+        # Unpack spot numbers in x and y
+        nx = self.n_spots[0]
+        cols = sequences % nx
+        rows = sequences // nx
+        
+        # Calculate jump distances in each axis
+        jumps_x = np.abs(np.diff(cols, axis=1))
+        jumps_y = np.abs(np.diff(rows, axis=1))
+
+        # Convert distances to additive ticks
+        ticks = (jumps_x * self.t_step_ticks_x) + (jumps_y * self.t_step_ticks_y)
+
+        # Finding the cumulative jump distances as tensor indices
+        time_indices = np.zeros(sequences.shape, dtype=int)
+        time_indices[:, 1:] = np.cumsum(ticks, axis=1)
+        
+        intended_mask = self.get_intended_dist()[self.tensor_mask]
+        
+        return _evaluation_core(self.tensor, intended_mask, sequences, time_indices, weighting) 
+    
+    def display(self, doses_dict):
+        '''
+        Plots the intended distribution plus any number of simulated sequences.
+        Args:
+            doses_dict (dict): A dictionary where keys are titles (strings) 
+                               and values are the dose arrays (1D flat).
+        '''
+        # Always include the intended distribution as the first plot
+        intended_2d = self.get_intended_dist().reshape(self.n_voxels_y, self.n_voxels_x)
+        
+        # Prepare titles and 2D arrays
+        titles = ["Intended (ITV)"] + list(doses_dict.keys())
+        all_doses = [intended_2d]
+        for d in doses_dict.values():
+            # If d has 2 dimensions (Phases, Voxels), take the mean across phases
+            if d.ndim == 2:
+                d_to_plot = np.mean(d, axis=0)
+            else:
+                d_to_plot = d
+                
+            all_doses.append(d_to_plot.reshape(self.n_voxels_y, self.n_voxels_x))
+        
+        # Find the global max dose to standardise the color scale
+        global_vmax = max([d.max() for d in all_doses])
+        global_vmin = 0
+
+        n_plots = len(all_doses)
+        cols = min(n_plots, 3)
+        rows = (n_plots + cols - 1) // cols
+        
+        fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 5*rows), squeeze=False)
+        extent = [-self.total_env_half_x, self.total_env_half_x, -self.total_env_half_y, self.total_env_half_y]
+
+        for i, ax in enumerate(axes.flat):
+            if i < n_plots:
+                im = ax.imshow(all_doses[i], extent=extent, origin='lower', 
+                               cmap='jet', vmin=global_vmin, vmax=global_vmax)
+                
+                ax.set_title(titles[i])
+                ax.set_xlabel("X (cm)")
+                ax.set_ylabel("Y (cm)")
+                ax.set_aspect('equal')
+                fig.colorbar(im, ax=ax, fraction=0.05, pad=0.04)
+            else:
+                ax.axis('off')
+
         plt.tight_layout()
         plt.show()

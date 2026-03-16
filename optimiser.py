@@ -6,23 +6,40 @@ import time
 from ITV_engine import _evaluation_core_single_thread
 
 @njit(cache = True)
-def _process_sequence(tensor, intended, seq, seq_len, times, weighting, t_step_ticks, mode_pen):
+def _process_sequence(tensor, intended, seq, seq_len, times, weighting, nx, t_ticks_x, t_ticks_y, mode_pen):
     
     # Find the times of the sequence
     times[0] = 0
     for s in range(1, seq_len):
         
-        dist = np.int16(abs(seq[s] - seq[s-1]))
+        # Working through spots
+        spot_prev = seq[s-1]
+        spot_curr = seq[s]
         
-        ticks = (dist * t_step_ticks) + ((dist == 0) * mode_pen)
+        # Unpack spot numbers in x and y
+        col_prev = spot_prev % nx
+        row_prev = spot_prev // nx
+        col_curr = spot_curr % nx
+        row_curr = spot_curr // nx
         
-        times[s] = times[s-1] + ticks
+        # Calculate absolute grid distances
+        dist_x = abs(col_curr - col_prev)
+        dist_y = abs(row_curr - row_prev)
+        
+        # Calculate tick jump for both dimensions
+        jump_ticks = (dist_x * t_ticks_x) + (dist_y * t_ticks_y)
+        
+        # Penalty for 0-distance jump
+        if jump_ticks == 0:
+            jump_ticks = mode_pen
+            
+        times[s] = times[s-1] + jump_ticks
     # Evaluate sequence    
     return _evaluation_core_single_thread(tensor, intended, seq, times, weighting)
     
 
 @njit(parallel=True, cache=True)
-def _sa_core(tensor, intended, start_seqs, iterations, temp, c_fact, weighting, n_bins, t_step_ticks, mode_penalty):
+def _sa_core(tensor, intended, start_seqs, iterations, temp, c_fact, weighting, n_bins, nx, t_ticks_x, t_ticks_y, mode_penalty):
     
     pop_size = start_seqs.shape[0]
     seq_len = start_seqs.shape[1]
@@ -46,7 +63,7 @@ def _sa_core(tensor, intended, start_seqs, iterations, temp, c_fact, weighting, 
         times = np.zeros(seq_len, dtype=np.int16)
         
         # Evaluate initial sequence    
-        current_mse = _process_sequence(tensor, intended, current_seq, seq_len, times, weighting, t_step_ticks, mode_penalty)
+        current_mse = _process_sequence(tensor, intended, current_seq, seq_len, times, weighting, nx, t_ticks_x, t_ticks_y, mode_penalty)
         best_mse = current_mse
         
         T = temp 
@@ -63,7 +80,7 @@ def _sa_core(tensor, intended, start_seqs, iterations, temp, c_fact, weighting, 
                 
             test_seq[idx1], test_seq[idx2] = test_seq[idx2], test_seq[idx1]
             
-            test_mse = _process_sequence(tensor, intended, test_seq, seq_len, times, weighting, t_step_ticks, mode_penalty)
+            test_mse = _process_sequence(tensor, intended, test_seq, seq_len, times, weighting, nx, t_ticks_x, t_ticks_y, mode_penalty)
             diff = test_mse - current_mse
             
             accepted_iter = 0 # Acceptance param
@@ -103,7 +120,7 @@ def _sa_core(tensor, intended, start_seqs, iterations, temp, c_fact, weighting, 
     return final_best_seqs, final_best_mses, all_acceptance_bins, all_mse_walkers, total_accepted
 
 @njit(parallel=True, cache=True)
-def _numba_mc_core(tensor, intended, base_seq, n_samples, weighting, t_step_ticks, mode_penalty):
+def _numba_mc_core(tensor, intended, base_seq, n_samples, weighting, nx, t_ticks_x, t_ticks_y, mode_penalty):
     
     seq_len = len(base_seq)
     # Preallocation
@@ -116,14 +133,14 @@ def _numba_mc_core(tensor, intended, base_seq, n_samples, weighting, t_step_tick
 
         times = np.zeros(seq_len, dtype=np.int16) # Preallocate times
         # Evaluate sequences
-        evals[i] = _process_sequence(tensor, intended, seq, seq_len, times, weighting, t_step_ticks, mode_penalty)
+        evals[i] = _process_sequence(tensor, intended, seq, seq_len, times, weighting, nx, t_ticks_x, t_ticks_y, mode_penalty)
         for s in range(seq_len):
             seqs[i, s] = seq[s]
             
     return seqs, evals
 
 @njit(parallel = True, cache = True)
-def _local_search_core(tensor, intended, pop_seqs, weighting, t_step_ticks, mode_penalty):
+def _local_search_core(tensor, intended, pop_seqs, weighting, nx, t_ticks_x, t_ticks_y, mode_penalty):
     
     pop_size = pop_seqs.shape[0]
     seq_len = pop_seqs.shape[1]
@@ -148,7 +165,7 @@ def _local_search_core(tensor, intended, pop_seqs, weighting, t_step_ticks, mode
                 test_seq[i], test_seq[j] = test_seq[j], test_seq[i]
                 
                 # Evaluate swap    
-                mse = _process_sequence(tensor, intended, test_seq, seq_len, times, weighting, t_step_ticks, mode_penalty)
+                mse = _process_sequence(tensor, intended, test_seq, seq_len, times, weighting, nx, t_ticks_x, t_ticks_y, mode_penalty)
                 
                 # Update if new sequence is best
                 if mse < best_local_mse:
@@ -167,7 +184,7 @@ def _local_search_core(tensor, intended, pop_seqs, weighting, t_step_ticks, mode
     return best_neighbour_seqs, best_neighbour_mses
 
 @njit(cache=True)
-def _hybrid_generation_loop(tensor, intended, base_seq, pop_seqs, pop_evals, generations, n_samples, weighting, t_step_ticks, mode_penalty):
+def _hybrid_generation_loop(tensor, intended, base_seq, pop_seqs, pop_evals, generations, n_samples, weighting, nx, t_ticks_x, t_ticks_y, mode_penalty):
     pop_size = pop_seqs.shape[0]
     seq_len = pop_seqs.shape[1]
     
@@ -181,7 +198,7 @@ def _hybrid_generation_loop(tensor, intended, base_seq, pop_seqs, pop_evals, gen
 
     for gen in range(generations):
         # Local search
-        neighbor_seqs, neighbor_mses =  _local_search_core(tensor, intended, best_seqs, weighting, t_step_ticks, mode_penalty)
+        neighbor_seqs, neighbor_mses =  _local_search_core(tensor, intended, best_seqs, weighting, nx, t_ticks_x, t_ticks_y, mode_penalty)
         
         num_stagnant = 0
         stagnant_indices = np.zeros(pop_size, dtype=np.int32)
@@ -203,7 +220,7 @@ def _hybrid_generation_loop(tensor, intended, base_seq, pop_seqs, pop_evals, gen
         if num_stagnant > 0:
             # Generate MC samples for replacement
             n_new_samples = int((n_samples // pop_size) * num_stagnant)
-            new_seqs, new_evals = _numba_mc_core(tensor, intended, base_seq, n_new_samples, weighting, t_step_ticks, mode_penalty)
+            new_seqs, new_evals = _numba_mc_core(tensor, intended, base_seq, n_new_samples, weighting, nx, t_ticks_x, t_ticks_y, mode_penalty)
             
             # Sort the best ones
             top_new_idx = np.argsort(new_evals)
@@ -216,7 +233,7 @@ def _hybrid_generation_loop(tensor, intended, base_seq, pop_seqs, pop_evals, gen
                     best_seqs[target_idx, s] = new_seqs[top_new_idx[k], s]
                     
         # New global MC samples to replace best sequences
-        global_new_seqs, global_new_evals = _numba_mc_core(tensor, intended, base_seq, n_samples, weighting, t_step_ticks, mode_penalty)
+        global_new_seqs, global_new_evals = _numba_mc_core(tensor, intended, base_seq, n_samples, weighting, nx, t_ticks_x, t_ticks_y, mode_penalty)
         # Sort the indexes
         global_top_idx = np.argsort(global_new_evals)
         
@@ -244,7 +261,7 @@ def _hybrid_generation_loop(tensor, intended, base_seq, pop_seqs, pop_evals, gen
     return best_seqs[0], best_evals[0]
 
 @njit(parallel = True, cache = True)
-def _exhaustive_core(tensor, intended, base_seq, weighting, t_step_ticks, mode_penalty):
+def _exhaustive_core(tensor, intended, base_seq, weighting, nx, t_ticks_x, t_ticks_y, mode_penalty):
     
     n = len(base_seq)
     
@@ -264,7 +281,7 @@ def _exhaustive_core(tensor, intended, base_seq, weighting, t_step_ticks, mode_p
         time_1d = np.zeros(n, dtype=np.int16)
         
         # Score the initial baseline for this branch
-        local_best_mse = _process_sequence(tensor, intended, seq, n, time_1d, weighting, t_step_ticks, mode_penalty)
+        local_best_mse = _process_sequence(tensor, intended, seq, n, time_1d, weighting, nx, t_ticks_x, t_ticks_y, mode_penalty)
         
         # Generation for the remaining (N-1)! permutations using Heap's algorithm
         M = n - 1
@@ -279,7 +296,7 @@ def _exhaustive_core(tensor, intended, base_seq, weighting, t_step_ticks, mode_p
                     seq[1 + c[i]], seq[1 + i] = seq[1 + i], seq[1 + c[i]]
                     
                 # Evaluate sequence
-                mse = _process_sequence(tensor, intended, seq, n, time_1d, weighting, t_step_ticks, mode_penalty)
+                mse = _process_sequence(tensor, intended, seq, n, time_1d, weighting, nx, t_ticks_x, t_ticks_y, mode_penalty)
                 
                 # Keep if it's the best on the thread
                 if mse < local_best_mse:
@@ -318,15 +335,28 @@ class SequenceOptimiser:
                 "Environment Error: Spot weights not set."
                 "You must call 'env.set_spot_weights()' before initialising the optimiser."
             )
+            
+        if hasattr(self.env, 'ctv_size'):
+        # For a 2d env
+            self.nx = np.int16(self.env.n_spots[0])
+            self.t_ticks_x = np.int16(self.env.t_step_ticks_x)
+            self.t_ticks_y = np.int16(self.env.t_step_ticks_y)
+        else:
+            # For a 1d env
+            self.nx = np.int16(self.env.n_spots) # Whole array here
+            self.t_ticks_x = np.int16(self.env.t_step_ticks)
+            self.t_ticks_y = np.int16(0) # Ignore
+            
+        if hasattr(self.env, 'mode_pen'):
+            self.mode_pen = np.int16(self.env.mode_pen)
+        else:
+            self.mode_pen = 0
 
         # Collect and crop the intended distribution the match the evaluation region of the tensor
         self.target_intended = self.env.get_intended_dist()[self.env.tensor_mask]
         
         self.base_sequence = self.env.spots_expanded
         self.seq_len = len(self.base_sequence)
-        
-        self.t_ticks = np.int16(self.env.t_step_ticks)
-        self.mode_pen = np.int16(self.env.mode_pen)
         
         self.rng = np.random.default_rng()
         
@@ -354,7 +384,7 @@ class SequenceOptimiser:
         print(f"Running Monte Carlo ({n_samples} samples)")
         start_time = time.perf_counter()
         base_seq = self.base_sequence.astype(np.int16)
-        sequences, evals = _numba_mc_core(self.env.tensor, self.target_intended, base_seq, n_samples, weighting, self.t_ticks, self.mode_pen)
+        sequences, evals = _numba_mc_core(self.env.tensor, self.target_intended, base_seq, n_samples, weighting, self.nx, self.t_ticks_x, self.t_ticks_y, self.mode_pen)
         
         best_idx = np.argmin(evals)
         
@@ -372,7 +402,7 @@ class SequenceOptimiser:
         base_seq = self.base_sequence.astype(np.int16)
         
         # Run exhaustive core
-        best_seqs, best_evals = _exhaustive_core(self.env.tensor, self.target_intended, base_seq, weighting, self.t_ticks, self.mode_pen)
+        best_seqs, best_evals = _exhaustive_core(self.env.tensor, self.target_intended, base_seq, weighting, self.nx, self.t_ticks_x, self.t_ticks_y, self.mode_pen)
         # Find theglobal best sequence
         best_idx = np.argmin(best_evals)
         
@@ -390,11 +420,11 @@ class SequenceOptimiser:
         # Get initial baseline score
         times = np.zeros(self.seq_len, dtype=np.int16)
 
-        current_mse = _process_sequence(self.env.tensor, self.target_intended, current_seq[0], self.seq_len, times, weighting, self.t_ticks, self.mode_pen)
+        current_mse = _process_sequence(self.env.tensor, self.target_intended, current_seq[0], self.seq_len, times, weighting, self.nx, self.t_ticks_x, self.t_ticks_y, self.mode_pen)
         
         for i in range(iterations):
             # The Numba core tests all pair swaps in C-memory and returns the absolute best one
-            best_neighbor_seqs, best_neighbor_mses = _local_search_core(self.env.tensor, self.target_intended, current_seq, weighting, self.t_ticks, self.mode_pen)
+            best_neighbor_seqs, best_neighbor_mses = _local_search_core(self.env.tensor, self.target_intended, current_seq, weighting, self.nx, self.t_ticks_x, self.t_ticks_y, self.mode_pen)
             
             # Did the Numba core find a better sequence?
             if best_neighbor_mses[0] < current_mse:
@@ -420,7 +450,7 @@ class SequenceOptimiser:
         c_fact = (final_temp / temp) ** (1.0 / iterations)
     
         # Run SA core
-        best_seqs, best_mses, all_bins, all_walkers, all_accepted = _sa_core(self.env.tensor, self.target_intended, current_seqs, iterations, temp, c_fact, weighting, n_bins, self.t_ticks, self.mode_pen)
+        best_seqs, best_mses, all_bins, all_walkers, all_accepted = _sa_core(self.env.tensor, self.target_intended, current_seqs, iterations, temp, c_fact, weighting, n_bins, self.nx, self.t_ticks_x, self.t_ticks_y, self.mode_pen)
         
         # FInd global minimum
         best_idx = np.argmin(best_mses)
@@ -453,15 +483,15 @@ class SequenceOptimiser:
         
         base_seq = self.base_sequence.astype(np.int16)
         
-        # 1. Get Initial Seed Population
-        trial_seqs, trial_evals = _numba_mc_core(self.env.tensor, self.target_intended, base_seq, n_samples, weighting, self.t_ticks, self.mode_pen)
+        # Get initial population
+        trial_seqs, trial_evals = _numba_mc_core(self.env.tensor, self.target_intended, base_seq, n_samples, weighting, self.nx, self.t_ticks_x, self.t_ticks_y, self.mode_pen)
         
         sorted_idx = np.argsort(trial_evals)
         best_seqs = trial_seqs[sorted_idx[:population_size]]
         best_evals = trial_evals[sorted_idx[:population_size]]
         
-        # 2. Fire the Mega-Loop
-        final_seq, final_mse = _hybrid_generation_loop(self.env.tensor, self.target_intended, base_seq, best_seqs, best_evals, generations, n_samples, weighting, self.t_ticks, self.mode_pen)
+        # Fire loop
+        final_seq, final_mse = _hybrid_generation_loop(self.env.tensor, self.target_intended, base_seq, best_seqs, best_evals, generations, n_samples, weighting, self.nx, self.t_ticks_x, self.t_ticks_y, self.mode_pen)
 
         duration = time.perf_counter() - start_time
         print(f"Hybrid Search completed in {duration:.4f}s")
