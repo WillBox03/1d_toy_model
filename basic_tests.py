@@ -11,7 +11,7 @@ resolution = 0.01 # in cm
 
 ctv_length = 2 # in cm
 
-n_spots = 15
+n_spots = 10
 
 amp = 1 #in cm
 
@@ -21,13 +21,13 @@ region = 'itv'
 
 env = ITV_env(resolution, ctv_length, n_spots, amp, t_step = t_step)
 
-env.set_spot_weights('uniform', repaints = 9) # Uniform weighting
+env.set_spot_weights('uniform', repaints = 50) # Uniform weighting
 
 period = 5 # in s
 
 starting_phase = 0 # in rads
 
-phases = 8
+phases = 36
 
 weighting = False
 
@@ -57,23 +57,19 @@ print(f"Tensor mask loaded in {duration:.4f} seconds")
 
 optimiser = SequenceOptimiser(env)
 
-#optimal_sequence, optimal_mse, _ = optimiser.run('simanneal', iterations = 10000, pop_size = 50, weighting = weighting)
-#optimal_dist, _ = env.sim(period, optimal_sequence, starting_phase= starting_phase, n_phases = phases, region = region, weighting = weighting)
-#print(f'Optimal sequence (simulated annealing) is {optimal_sequence}')
+optimal_sequence, optimal_mse, _ = optimiser.run('simanneal', iterations = 100000, pop_size = 100, weighting = weighting)
+optimal_dist, _ = env.sim(period, optimal_sequence, starting_phase= starting_phase, n_phases = phases, region = region, weighting = weighting)
+print(f'Optimal sequence (simulated annealing) is {optimal_sequence}')
 
-sims = [lr_rast_dist, rand_dist, max_time_dist]
-names = ['Left-Right Raster', 'Random', 'Max-Time']
+sims = [lr_rast_dist, rand_dist, max_time_dist, optimal_dist]
+names = ['Left-Right Raster', 'Random', 'Max-Time', 'Sim Anneal']
 
 print(f"""wmses for a starting phase of {starting_phase} are:
       {names[0]}:{lr_rast_mse},
       {names[1]}:{rand_mse},
-      {names[2]}:{max_time_mse}
+      {names[2]}:{max_time_mse},
+      {names[3]}:{optimal_mse}
       """)
-
-'''print(f"""Average wmses for all starting phases:
-      {names[0]}:{lr_rast_avg_wmse}
-      {names[1]}:{rl_rast_avg_wmse}
-      """)'''
 
 # Display
 env.display(sims, labels= names, avg_phases=True)

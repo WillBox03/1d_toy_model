@@ -1,34 +1,30 @@
-import numpy as np
-import matplotlib.pyplot as plt
-
-# Assuming your class is in a file named environment.py
 from ITV_engine import ITV_env_2D 
 from optimiser import SequenceOptimiser
 
 def run_comparison_test():
-    # 1. Setup Parameters (matching your request)
+    # Setup Parameters
     ctv_size = (2.0, 2.0)
     n_spots = (10, 15)
     amp = (0, 0.5)      
-    res = 0.05            # Lowered for faster tensor calculation
+    res = 0.05       # Lowered for faster optimiser calculation
     t_steps = (0.1, 0.1)
     period = 7.0
     margin = (1.0, 0.5)
     weighting = False
-    starting_phase = 0.0
+    starting_phase = None
     region = 'itv'
 
     # Initialize Engine
     env = ITV_env_2D(ctv_size=ctv_size, n_spots=n_spots, amp=amp, 
                       res=res, t_steps=t_steps, margin=margin)
     
-    env.set_spot_weights('uniform', repaints= 1)
+    env.set_spot_weights('uniform', repaints= 2)
     
     # Baseline plots
     # Baseline Raster
     raster_seq = env.set_sequence('lr_rast')
     raster_dose, raster_err = env.sim(period=period, sequence=raster_seq, starting_phase=starting_phase, weighting=weighting, region = region)
-    
+
     # Random Sequence
     rand_seq = env.set_sequence('rand')
     rand_dose, rand_err = env.sim(period=period, sequence=rand_seq, starting_phase=starting_phase, weighting=weighting, region = region)
@@ -44,11 +40,11 @@ def run_comparison_test():
 
     # Optimisation Methods
     # Monte Carlo
-    mc_seq, mc_err, _ = opt.monte_carlo(n_samples=20000, weighting=weighting)
+    mc_seq, mc_err, _ = opt.monte_carlo(n_samples=100000, weighting=weighting)
     mc_dose, _ = env.sim(period=period, sequence=mc_seq, starting_phase=starting_phase, weighting=weighting, region = region)
 
     # Simulated Annealing
-    best_sa_seq, sa_err, _ = opt.simulated_annealing(iterations=10000, pop_size=50, weighting=weighting)
+    best_sa_seq, sa_err, _ = opt.simulated_annealing(iterations=10000, pop_size=30, weighting=weighting)
     sa_dose, _ = env.sim(period=period, sequence=best_sa_seq, starting_phase=starting_phase, weighting=weighting, region = region)
 
     # Results

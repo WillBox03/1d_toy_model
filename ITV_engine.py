@@ -3,12 +3,111 @@ import math
 import matplotlib.pyplot as plt
 from numba import njit, prange
 
-@njit(parallel=True, cache = True)
+@njit(parallel=True, cache=True)
+def _build_tensor(shifts, spot_l, spot_r, env, max_hits):
+    
+    P = shifts.shape[0] # Starting Phases
+    T = shifts.shape[1] # Time points
+    S = len(spot_l) # Number of spots
+    V = len(env) # Number of voxels in environment
+    
+    # Initialise tensor with -1 for empty voxels
+    tensor = np.full((P, S, T, max_hits), -1, dtype=np.int32)
+    
+    for p in prange(P):
+        for s in range(S):
+            for t in range(T):
+                hit_count = 0
+                shift = shifts[p, t]
+                
+                edge_l = spot_l[s] - shift
+                edge_r = spot_r[s] - shift
+                
+                for v in range(V):
+                    if env[v] > edge_l and env[v] < edge_r:
+                        if hit_count < max_hits:
+                            tensor[p, s, t, hit_count] = v
+                            hit_count += 1
+    
+    return tensor
+
+@njit(parallel=True, cache=True)
+def _build_tensor_2d(shifts_x, shifts_y, spot_l, spot_r, spot_b, spot_t, env_x, env_y, max_hits):
+    
+    P = shifts_x.shape[0] # Starting Phases
+    T = shifts_x.shape[1] # Time points
+    S = len(spot_l) # Number of spots
+    V = len(env_x) # Number of voxels in environment
+    
+    # Initialise tensor with -1 for empty voxels
+    tensor = np.full((P, S, T, max_hits), -1, dtype=np.int32)
+    
+    for p in prange(P):
+        for s in range(S):
+            for t in range(T):
+                hit_count = 0
+                shift_x = shifts_x[p, t]
+                shift_y = shifts_y[p, t]
+                
+                edge_l = spot_l[s] - shift_x
+                edge_r = spot_r[s] - shift_x
+                edge_b = spot_b[s] - shift_y
+                edge_t = spot_t[s] - shift_y
+                
+                for v in range(V):
+                    if env_x[v] > edge_l and env_x[v] < edge_r and env_y[v] > edge_b and env_y[v] < edge_t:
+                        if hit_count < max_hits:
+                            tensor[p, s, t, hit_count] = v
+                            hit_count += 1
+    
+    return tensor
+
+@njit(cache = True)
+def _evaluation_core_single_thread(tensor, intended, seq, time_indices, weighting):
+    
+    n_phases = tensor.shape[0]
+    n_voxels = len(intended)
+    max_hits = tensor.shape[3]
+    seq_len = seq.shape[0]
+    
+    total_sq_diff = 0.0
+    phase_dose = np.zeros(n_voxels)
+    
+    for p in range(n_phases):
+        # Zero out the dose array
+        for v in range(n_voxels):
+            phase_dose[v] = 0.0
+            
+        # Accumulate dose
+        for s in range(seq_len):
+            spot = seq[s]
+            time_idx = time_indices[s]
+            # Search voxels which are hit with dose
+            for h in range(max_hits):
+                v_idx = tensor[p, spot, time_idx, h] # Get voxel environment index
+                
+                if v_idx == -1: # If index is -1, exit loop
+                    break
+                
+                phase_dose[v_idx] += 1.0
+                
+        # Calculate Error
+        for v in range(n_voxels):
+            diff = phase_dose[v] - intended[v]
+            sq_diff = diff * diff
+            if weighting and diff < 0:
+                sq_diff *= 5.0
+            total_sq_diff += sq_diff
+            
+    return total_sq_diff / (n_phases * n_voxels) # Return the average MSE
+
+@njit(parallel=True, cache=True)
 def _evaluation_core(tensor, intended, sequences, time_indices, weighting):
     
     n_sequences = sequences.shape[0]
     n_phases = tensor.shape[0]
-    n_voxels = tensor.shape[3]
+    max_hits = tensor.shape[3]
+    n_voxels = len(intended)
     seq_len = sequences.shape[1]
     
     evals = np.zeros(n_sequences)
@@ -16,8 +115,6 @@ def _evaluation_core(tensor, intended, sequences, time_indices, weighting):
     for i in prange(n_sequences):
         total_sq_diff = 0.0
         
-        # Hold dosage for this phase
-        phase_dose = np.zeros(n_voxels)
         for p in range(n_phases):
             phase_dose = np.zeros(n_voxels)
             
@@ -26,9 +123,14 @@ def _evaluation_core(tensor, intended, sequences, time_indices, weighting):
                 spot = sequences[i, s]
                 time_idx = time_indices[i, s]
                 
-                # For each voxel
-                for v in range(n_voxels):
-                    phase_dose[v] += tensor[p, spot, time_idx, v]
+                # Search voxels which are hit with dose
+                for h in range(max_hits):
+                    v_idx = tensor[p, spot, time_idx, h] # Get voxel environment index
+                    
+                    if v_idx == -1: # If index is -1, exit loop
+                        break
+                    
+                    phase_dose[v_idx] += 1.0
             
             # Calculate MSE for the phase
             for v in range(n_voxels):
@@ -40,42 +142,10 @@ def _evaluation_core(tensor, intended, sequences, time_indices, weighting):
                     
                 total_sq_diff += sq_diff
                 
-        # Average
+        # Average the MSE
         evals[i] = total_sq_diff / (n_phases * n_voxels)
         
-    return evals
-
-@njit(cache = True)
-def _evaluation_core_single_thread(tensor, intended, seq, time_indices, weighting):
-    
-    n_phases = tensor.shape[0]
-    n_voxels = tensor.shape[3]
-    seq_len = seq.shape[0]
-    
-    total_sq_diff = 0.0
-    phase_dose = np.zeros(n_voxels) # Allocate once!
-    
-    for p in range(n_phases):
-        # Zero out the dose array
-        for v in range(n_voxels):
-            phase_dose[v] = 0.0
-            
-        # Accumulate dose (Fast contiguous memory read)
-        for s in range(seq_len):
-            spot = seq[s]
-            time_idx = time_indices[s]
-            for v in range(n_voxels):
-                phase_dose[v] += tensor[p, spot, time_idx, v]
-                
-        # Calculate Error
-        for v in range(n_voxels):
-            diff = phase_dose[v] - intended[v]
-            sq_diff = diff * diff
-            if weighting and diff < 0:
-                sq_diff *= 5.0
-            total_sq_diff += sq_diff
-            
-    return total_sq_diff / (n_phases * n_voxels)
+    return evals # Return all MSEs
 
 def find_max_dist(spots_expanded):
             '''
@@ -257,7 +327,7 @@ class ITV_env:
 
         return sequence
 
-    def sim(self, period, sequence, starting_phase = None, n_phases = 8, weighting = True, mode = '1d', region = 'ctv'):
+    def sim(self, period, sequence, starting_phase = None, n_phases = 24, weighting = True, mode = '1d', region = 'ctv'):
         
         '''
         Simulates spot scanning sequence in a moving target, returning the resultant dose distribution
@@ -361,7 +431,7 @@ class ITV_env:
             
         return np.mean(sq_diffs)
           
-    def calculate_mask_tensor(self, period, starting_phase = None, n_phases = 8, mode = '1d', region = 'ctv'):
+    def calculate_mask_tensor(self, period, starting_phase = None, n_phases = 24, mode = '1d', region = 'ctv'):
         """
         Precomputes all possible spot/time combinations.
     
@@ -400,15 +470,10 @@ class ITV_env:
         else:
             phases = np.array([starting_phase])[:, np.newaxis]
             
-        #Create 4D tensor, currently filled with the phase shifts at each timepoint with each starting phase
-        #Dimensions (P,1,T,1)
-        all_shifts = (self.amp*np.sin((phase_speed*times) + phases))[:, np.newaxis, :, np.newaxis]
-
-        #Find the left and right edges in dimensions (1, S, 1, 1)
-        left_edges = self.spot_left_edges[np.newaxis, :, np.newaxis, np.newaxis]
-        right_edges = self.spot_right_edges[np.newaxis, :, np.newaxis, np.newaxis]
+        # Create shift matrix
+        shifts = self.amp*np.sin((phase_speed*times) + phases)
         
-        # Define mask based on evaluation region
+        # Define target region
         if region.lower() == 'ctv':
             self.tensor_mask = (self.env_space >= -self.ctv_half_length) & (self.env_space <= self.ctv_half_length)
         elif region.lower() == 'itv':
@@ -416,14 +481,14 @@ class ITV_env:
         else:
             raise ValueError("Region must be 'ctv' or 'itv'")
         
-        target_env_space = self.env_space[self.tensor_mask]
+        # Target voxel coords
+        target_env = self.env_space[self.tensor_mask]
         
-        #Reshape env space to (1,1,1,V)
-        env_space = target_env_space[np.newaxis, np.newaxis, np.newaxis, :]
+        # Calculate the maximum possible number of voxels hit by a spot
+        max_hits = int(np.ceil(self.spot_size / self.res)) + 2
 
-        #Generate the masks for all phases, for all spots, for all time steps
-        #Resulting tensor has dimensions (P,S,T,V)
-        self.tensor = (env_space > (left_edges - all_shifts)) & (env_space < (right_edges - all_shifts))
+        # Generate tensor for all phases, for all spots, for all time steps, for all the voxels hit
+        self.tensor = _build_tensor(shifts, self.spot_left_edges, self.spot_right_edges, target_env, max_hits)
     
     def evaluate_sequences(self, sequences, weighting = True):
         """
@@ -563,7 +628,7 @@ class ITV_env_2D:
         self.n_voxels_x = int(np.round((2 * self.total_env_half_x) / self.res))
         self.n_voxels_y = int(np.round((2 * self.total_env_half_y) / self.res))
         
-        ## Create 2D coordinate space
+        # Create 2D coordinate space
         x_axis = np.linspace(-self.total_env_half_x + self.res/2, self.total_env_half_x - self.res/2, self.n_voxels_x)
         y_axis = np.linspace(-self.total_env_half_y + self.res/2, self.total_env_half_y - self.res/2, self.n_voxels_y)
         X, Y = np.meshgrid(x_axis, y_axis)        
@@ -586,8 +651,6 @@ class ITV_env_2D:
         self.spot_right = self.spot_centres_x + spot_size_x / 2
         self.spot_bottom = self.spot_centres_y - spot_size_y / 2
         self.spot_top = self.spot_centres_y + spot_size_y / 2
-        
-        
         
         # Calculating engine time constants
         multiplier = 100000 # Correct for floating point errors
@@ -665,7 +728,7 @@ class ITV_env_2D:
                 raise ValueError(f"Unknown preset: '{sequence}'. Available: {list(presets.keys())}")  
         return sequence
 
-    def sim(self, period, sequence, starting_phase = None, n_phases = 4, weighting = True, region = 'ctv'):
+    def sim(self, period, sequence, starting_phase = None, n_phases = 36, weighting = True, region = 'ctv'):
         
         '''
         Simulates spot scanning sequence in a moving target, returning the resultant dose distribution
@@ -784,7 +847,7 @@ class ITV_env_2D:
             
         return np.mean(sq_diffs)
           
-    def calculate_mask_tensor(self, period, starting_phase = None, n_phases = 4, region = 'ctv'):
+    def calculate_mask_tensor(self, period, starting_phase = None, n_phases = 36, region = 'ctv'):
         """
         Precomputes all possible spot/time combinations.
     
@@ -824,18 +887,11 @@ class ITV_env_2D:
         else:
             phases = np.array([starting_phase])[:, np.newaxis]
             
-        #Create 4D tensor, currently filled with the phase shifts at each timepoint with each starting phase
-        #Dimensions (P,1,T,1)
-        shifts_x = (self.amp_x * np.sin((phase_speed * times) + phases))[:, np.newaxis, :, np.newaxis]
-        shifts_y = (self.amp_y * np.sin((phase_speed * times) + phases))[:, np.newaxis, :, np.newaxis]
+        # Create shift matrices
+        shifts_x = self.amp_x * np.sin((phase_speed * times) + phases)
+        shifts_y = self.amp_y * np.sin((phase_speed * times) + phases)
 
-        #Find the spot edges for (1, S, 1, 1)
-        l_edges = self.spot_left[np.newaxis, :, np.newaxis, np.newaxis]
-        r_edges = self.spot_right[np.newaxis, :, np.newaxis, np.newaxis]
-        b_edges = self.spot_bottom[np.newaxis, :, np.newaxis, np.newaxis]
-        t_edges = self.spot_top[np.newaxis, :, np.newaxis, np.newaxis]
-        
-        # Define mask based on evaluation region
+        # Define target region
         if region.lower() == 'ctv':
             self.tensor_mask = (np.abs(self.env_space_x) <= self.ctv_half_x) & \
                                (np.abs(self.env_space_y) <= self.ctv_half_y)
@@ -845,17 +901,17 @@ class ITV_env_2D:
         else:
             raise ValueError("Region must be 'ctv' or 'itv'")
         
-        # Target voxel coordinates in environment space in (1,1,1,V)
-        target_x = self.env_space_x[self.tensor_mask][np.newaxis, np.newaxis, np.newaxis, :]
-        target_y = self.env_space_y[self.tensor_mask][np.newaxis, np.newaxis, np.newaxis, :]
+        # Target voxel coords
+        target_x = self.env_space_x[self.tensor_mask]
+        target_y = self.env_space_y[self.tensor_mask]
 
-        # Check if target voxel is within X-bounds AND Y-bounds simultaneously
-        mask_x = (target_x > (l_edges - shifts_x)) & (target_x < (r_edges - shifts_x))
-        mask_y = (target_y > (b_edges - shifts_y)) & (target_y < (t_edges - shifts_y))
+        # Calculate the maximum possible number of voxels hit by a spot
+        max_hits_x = int(np.ceil(self.spot_size[0] / self.res)) + 2
+        max_hits_y = int(np.ceil(self.spot_size[1] / self.res)) + 2
+        max_hits = max_hits_x * max_hits_y
         
-        #Generate the masks for all phases, for all spots, for all time steps
-        #Resulting tensor has dimensions (P,S,T,V)
-        self.tensor = (mask_x & mask_y).astype(np.bool_)
+        # Generate tensor for all phases, for all spots, for all time steps, for all the voxels hit
+        self.tensor = _build_tensor_2d(shifts_x, shifts_y, self.spot_left, self.spot_right, self.spot_bottom, self.spot_top, target_x, target_y, max_hits)
     
     def evaluate_sequences(self, sequences, weighting = True):
         """
