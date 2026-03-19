@@ -4,48 +4,50 @@ from optimiser import SequenceOptimiser
 def run_comparison_test():
     # Setup Parameters
     ctv_size = (2.0, 2.0)
-    n_spots = (10, 15)
-    amp = (0, 0.5)      
-    res = 0.05       # Lowered for faster optimiser calculation
-    t_steps = (0.1, 0.1)
-    period = 7.0
-    margin = (1.0, 0.5)
+    n_spots = (6,9)
+    spot_size = (0.333, 0.33)
+    amp = (0.0, 0.5)      
+    res = 0.05    # Lowered for faster optimiser calculation
+    t_steps = (0.05, 0.05)
+    period = 3.0
+    margin = (1, 0.5)
     weighting = False
     starting_phase = None
     region = 'itv'
+    motion = 'sin6'
 
     # Initialize Engine
-    env = ITV_env_2D(ctv_size=ctv_size, n_spots=n_spots, amp=amp, 
+    env = ITV_env_2D(ctv_size=ctv_size, n_spots=n_spots, spot_size = spot_size, amp=amp, 
                       res=res, t_steps=t_steps, margin=margin)
     
-    env.set_spot_weights('uniform', repaints= 2)
+    env.set_spot_weights('uniform', repaints= 9)
     
     # Baseline plots
     # Baseline Raster
     raster_seq = env.set_sequence('lr_rast')
-    raster_dose, raster_err = env.sim(period=period, sequence=raster_seq, starting_phase=starting_phase, weighting=weighting, region = region)
+    raster_dose, raster_err = env.sim(period=period, sequence=raster_seq, starting_phase=starting_phase, weighting=weighting, region = region, motion=motion)
 
     # Random Sequence
     rand_seq = env.set_sequence('rand')
-    rand_dose, rand_err = env.sim(period=period, sequence=rand_seq, starting_phase=starting_phase, weighting=weighting, region = region)
-    
+    rand_dose, rand_err = env.sim(period=period, sequence=rand_seq, starting_phase=starting_phase, weighting=weighting, region = region, motion=motion)
+
     # Maximum Distance/Time Sequence
     max_seq = env.set_sequence('max_dist')
-    max_dose, max_err = env.sim(period=period, sequence=max_seq, starting_phase=starting_phase, weighting=weighting, region = region)
+    max_dose, max_err = env.sim(period=period, sequence=max_seq, starting_phase=starting_phase, weighting=weighting, region = region, motion=motion)
 
     # Tensor Calculation
     print("Precomputing Tensor")
-    env.calculate_mask_tensor(period=period, starting_phase=starting_phase, region = region)
+    env.calculate_mask_tensor(period=period, starting_phase=starting_phase, region = region, motion=motion)
     opt = SequenceOptimiser(env)
 
     # Optimisation Methods
     # Monte Carlo
-    mc_seq, mc_err, _ = opt.monte_carlo(n_samples=100000, weighting=weighting)
-    mc_dose, _ = env.sim(period=period, sequence=mc_seq, starting_phase=starting_phase, weighting=weighting, region = region)
+    mc_seq, mc_err, _ = opt.monte_carlo(n_samples=10000, weighting=weighting)
+    mc_dose, _ = env.sim(period=period, sequence=mc_seq, starting_phase=starting_phase, weighting=weighting, region = region, motion=motion)
 
     # Simulated Annealing
-    best_sa_seq, sa_err, _ = opt.simulated_annealing(iterations=10000, pop_size=30, weighting=weighting)
-    sa_dose, _ = env.sim(period=period, sequence=best_sa_seq, starting_phase=starting_phase, weighting=weighting, region = region)
+    best_sa_seq, sa_err, _ = opt.simulated_annealing(iterations=10000, pop_size=20, weighting=weighting)
+    sa_dose, _ = env.sim(period=period, sequence=best_sa_seq, starting_phase=starting_phase, weighting=weighting, region = region, motion=motion)
 
     # Results
     print("FINAL RESULTS (MSE)")
@@ -63,6 +65,13 @@ def run_comparison_test():
         f"Monte Carlo\n(MSE: {mc_err:.4f})": mc_dose,
         f"Sim Annealing\n(MSE: {sa_err:.4f})": sa_dose
     })
+    
+    dose = {
+        'Raster': raster_dose,
+        'Optimal': sa_dose
+    }
+    
+    env.display_dvh(dose, regions = ['itv', 'ctv'])
 
 if __name__ == "__main__":
     run_comparison_test()

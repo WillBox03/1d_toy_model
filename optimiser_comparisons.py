@@ -5,7 +5,7 @@ import gc
 import os
 
 from optimiser import SequenceOptimiser
-from ITV_engine import ITV_env
+from ITV_engine import ITV_env_1D
 
 def autotune_optimisers(opt, target_times = [1.0, 2.0, 5.0, 10.0]):
     """
@@ -59,7 +59,7 @@ def autotune_optimisers(opt, target_times = [1.0, 2.0, 5.0, 10.0]):
     print(f"HYB speed: {time_per_gen:.3f} sec/gen")
     
     # Calibrate SA
-    base_sa_pop = 10
+    base_sa_pop = 20
     base_sa_iters = 100000
     start = time.perf_counter()
     opt.run('simanneal', iterations=base_sa_iters, pop_size=base_sa_pop, temp=0.3, final_temp=0.001)
@@ -99,7 +99,7 @@ def optimiser_analysis(ctv_length, amp, period, t_step=0.1, n_spots=10, repaints
     print("Starting Benchmark...")   
     
     # Initialise environment
-    env = ITV_env(resolution, ctv_length, n_spots, amp, t_step = t_step)
+    env = ITV_env_1D(resolution, ctv_length, n_spots, amp, t_step = t_step)
     env.set_spot_weights('uniform', repaints = repaints)
 
     start_time = time.perf_counter()
@@ -278,7 +278,7 @@ if __name__ == "__main__":
     repaints = [0, 1, 4, 9, 19]
     
     for scenario in scenarios:
-        save_dir = f"./benchmarks/Exp1_Period_vs_Repaints/{scenario['name']}"
+        save_dir = f"./benchmarks_v2/Exp1_Period_vs_Repaints/{scenario['name']}"
         os.makedirs(save_dir, exist_ok=True)
         for per in periods:
             for rep in repaints:
@@ -308,24 +308,5 @@ if __name__ == "__main__":
                     n_spots=fixed_spots, repaints=repaint,
                     save_directory=save_dir
                 )
-
-    # ---------------------------------------------------------
-    print("\n\n=== EXPERIMENT 3: The Mini Complexity Sweep ===")
-    periods_mini = [3, 7]
-    spots_mini = [10, 20, 30]       # Test low vs medium spot resolution
-    repaints_mini = [0, 1, 4]      # Test single vs multiple passes
-    
-    for scenario in scenarios:
-        save_dir = f"./benchmarks/Exp3_Spot_Size_Complexity/{scenario['name']}"
-        os.makedirs(save_dir, exist_ok=True)
-        for per in periods_mini:
-            for spots in spots_mini:
-                for rep in repaints_mini:
-                    optimiser_analysis(
-                        ctv_length=scenario["ctv"], amp=scenario["amp"], 
-                        period=per, starting_phase=None,
-                        n_spots=spots, repaints=rep,
-                        save_directory=save_dir
-                    )
                     
     print("\nAll targeted experiments complete! Your data is neatly organized in /benchmarks.")

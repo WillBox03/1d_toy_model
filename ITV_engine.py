@@ -3,6 +3,10 @@ import math
 import matplotlib.pyplot as plt
 from numba import njit, prange
 
+###################################################
+# NUMBA CORES AND SHARED MATH HELPER FUNCTIONS
+###################################################
+
 @njit(parallel=True, cache=True)
 def _build_tensor(shifts, spot_l, spot_r, env, max_hits):
     
@@ -110,10 +114,21 @@ def _evaluation_core(tensor, intended, sequences, time_indices, weighting):
     n_voxels = len(intended)
     seq_len = sequences.shape[1]
     
-    evals = np.zeros(n_sequences)
+    # Pre-allocate output arrays
+    avg_mses = np.zeros(n_sequences)
+    worst_mses = np.zeros(n_sequences)
+    avg_dists = np.zeros((n_sequences, n_voxels))
+    worst_dists = np.zeros((n_sequences, n_voxels))
+    std_mses = np.zeros(n_sequences)
     
     for i in prange(n_sequences):
-        total_sq_diff = 0.0
+        seq_sum_mse = 0.0
+        seq_sum_sq_mse = 0.0
+        seq_worst_mse = -1.0
+        
+        # Temporary arrays to hold cumulative/worst doses for this specific sequence
+        seq_avg_dose = np.zeros(n_voxels)
+        seq_worst_dose = np.zeros(n_voxels)
         
         for p in range(n_phases):
             phase_dose = np.zeros(n_voxels)
@@ -133,6 +148,7 @@ def _evaluation_core(tensor, intended, sequences, time_indices, weighting):
                     phase_dose[v_idx] += 1.0
             
             # Calculate MSE for the phase
+            phase_sq_diff = 0.0
             for v in range(n_voxels):
                 diff = phase_dose[v] - intended[v]
                 sq_diff = diff * diff
@@ -140,12 +156,76 @@ def _evaluation_core(tensor, intended, sequences, time_indices, weighting):
                 if weighting and diff < 0:
                     sq_diff *= 5.0
                     
-                total_sq_diff += sq_diff
+                phase_sq_diff += sq_diff
                 
-        # Average the MSE
-        evals[i] = total_sq_diff / (n_phases * n_voxels)
+                # Accumulate the dose for the average distribution calculation
+                seq_avg_dose[v] += phase_dose[v]
+                
+            phase_mse = phase_sq_diff / n_voxels # Average phase MSE
+            seq_sum_mse += phase_mse
+            seq_sum_sq_mse += (phase_mse * phase_mse) # Square MSE, add to total for std
+            
+            # Check if this is the worst phase for this sequence
+            if p == 0 or phase_mse > seq_worst_mse:
+                seq_worst_mse = phase_mse
+                # Save the worst dose distribution
+                for v in range(n_voxels):
+                    seq_worst_dose[v] = phase_dose[v]
+                    
+        # Finalize the sequence and calculate standard deviation
+        avg_mse = seq_sum_mse / n_phases
+        avg_mses[i] = avg_mse
+        worst_mses[i] = seq_worst_mse
+        var = (seq_sum_sq_mse / n_phases) - (avg_mse * avg_mse)
+        std_mses[i] = math.sqrt(max(0.0, var)) # 0 divide error protection
         
-    return evals # Return all MSEs
+        for v in range(n_voxels):
+            avg_dists[i, v] = seq_avg_dose[v] / n_phases
+            worst_dists[i, v] = seq_worst_dose[v]
+            
+    return avg_mses, worst_mses, avg_dists, worst_dists
+
+def calculate_tick_constants(*times_in_seconds):
+    """Finds the GCD tick time and tick multipliers for any number of time constants."""
+    multiplier = 100000 # Correct for floating point errors
+    int_times = [int(np.round(t * multiplier)) for t in times_in_seconds]
+    gcd_val = math.gcd(*int_times) if len(int_times) > 1 else int_times[0] # Engine tick time
+    tick_time = gcd_val / multiplier
+    ticks = [int(np.round(t / tick_time)) for t in times_in_seconds]
+    return tick_time, ticks
+
+def generate_phases(n_phases, starting_phase):
+    """Generates the phase column vector"""
+    if starting_phase is None:
+        return np.linspace(0, 2*np.pi, n_phases, endpoint=False)[:, np.newaxis]
+    else:
+        return np.array([starting_phase])[:, np.newaxis]
+    
+def generate_phase_shifts(times, phases, period, motion):
+    """Generates the phase shifts at each time step for the selected motion type"""
+    if motion == 'sin':
+        phase_speed = 2 * np.pi / period 
+        return np.sin((phase_speed * times) + phases)
+    elif motion == 'sin6':
+        phase_speed = np.pi / period
+        return (2.0 * (np.sin((phase_speed * times) + phases) ** 6)) - 1.0
+    else:
+        raise ValueError(f"Unknown motion model: '{motion}'. Use 'sin' or 'sin6'.")
+    
+def calc_mse(dose_dist, intended_dist, region_mask, weighting=True):
+        '''Calculates the MSE of a resultant dose distribution.'''
+        region_dose = dose_dist[region_mask] if dose_dist.ndim == 1 else dose_dist[:, region_mask] # Check for starting phase and apply mask
+        intended_dose = intended_dist[region_mask]
+        
+        # Get squared errors of dose
+        diffs = region_dose - intended_dose
+        sq_diffs = diffs**2
+        
+        # If using weighted MSE, multiply negative errors
+        if weighting:
+            sq_diffs[diffs < 0] *= 5.0
+            
+        return np.mean(sq_diffs)
 
 def find_max_dist(spots_expanded):
             '''
@@ -178,42 +258,29 @@ def find_max_dist(spots_expanded):
                 seq[1::2] = upper
                 
                 return np.concatenate((np.array([mid]), np.roll(seq, 1))) # Add spot to the front at the end
-            
-class ITV_env:   
+
+###################################################
+# CLASS FOR 1D environments
+###################################################
+class ITV_env_1D:   
     '''
-    Environment space for the simulation
+    Environment space for the simulation in 1 dimension
     '''
-    def __init__(self, res, ctv_length, n_spots, amp, spot_size = None, t_step = 0.1, t_switch = 0.5, margin = None):
+    def __init__(self, res, ctv_length, amp, n_spots = None, spot_size = None, spacing = None, t_step = 0.1, t_switch = 0.5, margin = None):
         '''
         Initialises the environment, creating a high resolution coordinate space for the env of set length. Also defines positions of proton beam spots covering the ITV
         Args:
             res (float): Resolution of environment, in cm
             ctv_length (float,int): Length of env, in cm
             n_spots (int): Number of proton beam spots covering the ITV
-            amp(float): Amplitude of breathing motion, in cm
+            amp(float): Standard amplitude (half of the peak-to-peak amplitude) of breathing motion, in cm
             spot_size (float): Physical width of spot in cm
         '''
-        
-        if spot_size is None:
-            spot_size = (ctv_length + (2*amp)) / n_spots
             
         if margin is None:
             margin = amp
         
-        self.update_env(res=res, ctv_length=ctv_length, amp=amp, n_spots=n_spots, spot_size=spot_size, t_step=t_step, t_switch=t_switch, margin=margin)
-        
-        # Convert seconds to integers
-        multiplier = 100000 # Correct for floating point errors
-        int_step = int(np.round(self.t_step * multiplier))
-        int_switch = int(np.round(self.t_switch * multiplier))
-        
-        # Find the greatest common divisor to get the engine tick time
-        gcd_val = math.gcd(int_step, int_switch)
-        self.tick_time = gcd_val / multiplier
-        
-        # Calculate number of ticks for stepping and energy switching
-        self.t_step_ticks = int(np.round(self.t_step / self.tick_time))
-        self.t_switch_ticks = int(np.round(self.t_switch / self.tick_time))
+        self.update_env(res=res, ctv_length=ctv_length, amp=amp, n_spots=n_spots, spot_size=spot_size, spacing=spacing, t_step=t_step, t_switch=t_switch, margin=margin)
         
         self.mode_presets = {
             '1d': 0,
@@ -231,6 +298,7 @@ class ITV_env:
         if 'amp' in kwargs: self.amp = kwargs['amp']
         if 'n_spots' in kwargs: self.n_spots = kwargs['n_spots']
         if 'spot_size' in kwargs: self.spot_size = kwargs['spot_size']
+        if 'spacing' in kwargs: self.spacing = kwargs['spacing']
         if 't_step' in kwargs: self.t_step = kwargs['t_step']
         if 't_switch' in kwargs: self.t_switch = kwargs['t_switch']
         if 'margin' in kwargs: self.margin = kwargs['margin']
@@ -249,19 +317,58 @@ class ITV_env:
         self.env_space = np.linspace(-self.total_env_half_length + self.res/2, self.total_env_half_length - self.res/2, self.n_env_voxels)
         
         total_itv_width = 2 * self.itv_extent
-        total_spot_width = self.n_spots * self.spot_size
         
-        if total_spot_width > total_itv_width:
-            new_spot_size = total_itv_width / self.n_spots
-            print(f"WARNING: {self.n_spots} spots of size {self.spot_size}cm cannot fit in an ITV of {total_itv_width}cm without spot overlap. Spot width set to {new_spot_size}")
-            self.spot_size = new_spot_size
+        spot_keys = ['n_spots', 'spot_size', 'spacing']
+        spot_args = {k: kwargs[k] for k in spot_keys if k in kwargs and kwargs[k] is not None}
+        
+        if spot_args:
+            # Spot params passed in, must be exactly 2
+            if len(spot_args) != 2:
+                raise ValueError("When updating the grid, you must provide exactly two of: n_spots, spot_size, spacing.")
+            n_in = spot_args.get('n_spots')
+            size_in = spot_args.get('spot_size')
+            sp_in = spot_args.get('spacing')
+        else:
+            # No spot params passed in, default to recalculating spacing
+            n_in = getattr(self, 'n_spots', None)
+            size_in = getattr(self, 'spot_size', None)
+            sp_in = None
+            
+        if n_in is not None and size_in is not None and sp_in is None:
+            # Calculate spacing
+            sp_in = (total_itv_width - size_in) / (n_in - 1) if n_in > 1 else 0.0
+            
+        elif size_in is not None and sp_in is not None and n_in is None:
+            # Calculate number of spots
+            if sp_in > 0:
+                n_in = int(np.ceil((total_itv_width - size_in) / sp_in)) + 1 
+                sp_in = (total_itv_width - size_in) / (n_in - 1) if n_in > 1 else 0.0 # Recalculate spacing if needed to snap spots to ITV
+            else:
+                n_in = 1
+        elif n_in is not None and sp_in is not None and size_in is None:
+            # Calculate spot size
+            size_in = total_itv_width - (n_in - 1) * sp_in
+            if size_in <= 0:
+                raise ValueError("Spacing too large for the given number of spots in this ITV.")
+        else:
+            raise ValueError("You must provide exactly two of: 'n_spots', 'spot_size', or 'spacing'.")
+
+        # Save spot geometry
+        self.n_spots = n_in
+        self.spot_size = size_in
+        self.spacing = sp_in
+        
+        print(f"Spot Grid: {n_in} spots | Size: {size_in:.2f}cm | Spacing: {sp_in:.2f}cm")
         
         # Define spot centres and edges
-        spot_centres = np.linspace(-self.itv_extent + self.spot_size/2, self.itv_extent - self.spot_size/2, self.n_spots)
+        spot_centres = -self.itv_extent + self.spot_size/2 + (np.arange(self.n_spots) * self.spacing)
         
         # Define proton spot edges in environment
         self.spot_left_edges = spot_centres - self.spot_size / 2
         self.spot_right_edges = spot_centres + self.spot_size / 2
+        
+        # Set tick time and step ticks
+        self.tick_time, (self.t_step_ticks, self.t_switch_ticks) = calculate_tick_constants(self.t_step, self.t_switch)
 
         # Define empty attributes for spot weights and dose distribution
         self.spot_weights = np.zeros(self.n_spots, dtype=int)
@@ -327,7 +434,7 @@ class ITV_env:
 
         return sequence
 
-    def sim(self, period, sequence, starting_phase = None, n_phases = 24, weighting = True, mode = '1d', region = 'ctv'):
+    def sim(self, period, sequence, starting_phase = None, n_phases = 24, weighting = True, mode = '1d', region = 'itv', motion = 'sin'):
         
         '''
         Simulates spot scanning sequence in a moving target, returning the resultant dose distribution
@@ -341,8 +448,6 @@ class ITV_env:
             raise ValueError(f'Mode "{mode}" not recognised. Available: {list(self.mode_presets.keys())}')
         
         sequence = self.set_sequence(sequence)
-        
-        phase = 2*np.pi/period # Phase of breathing
         
         jumps = abs(sequence[1:] - sequence[:-1]) # Distance between each proton beam spot in sequence
 
@@ -358,14 +463,9 @@ class ITV_env:
         # Convert ticks to seconds for physical calculations
         times = cumulative_ticks * self.tick_time
         
-        if starting_phase is None:
-            # Vectorize over selected phases
-            phases = np.linspace(0, 2*np.pi, n_phases, endpoint=False)[:, np.newaxis]
-        else:
-            # Simulate just the single specified phase
-            phases = np.array([starting_phase])[:, np.newaxis]
+        phases = generate_phases(n_phases, starting_phase)
 
-        shifts = self.amp*np.sin((phase*times) + phases) # Resultant positional shift at each time
+        shifts = generate_phase_shifts(times, phases, period, motion)
 
         # Find the spot edges in sequence order
         left_edges = self.spot_left_edges[sequence]
@@ -396,42 +496,24 @@ class ITV_env:
     
         spot_masks = (self.env_space > left_edges) & (self.env_space < right_edges)
         
-        return spot_masks.T @ self.spot_weights
+        return (spot_masks.T @ self.spot_weights).astype(np.float64)
     
-    def calc_error(self, dose_dist, weighting = True, region = 'ctv'):
-        '''
-        Calculates the error of a resultant dose distribution against the intended distribution.
-        If weighting=True, applies a penalty (x5) to underdosed voxels (WMSE).
-        Otherwise, returns standard MSE.
-        '''
-        
-        # Check which region is evaluated and mask:
+    def get_region_mask(self, region):
+        '''Check which region is evaluated and returns mask of environment'''
         if region == 'ctv':
-            region_mask = (self.env_space >= -self.ctv_half_length) & (self.env_space <= self.ctv_half_length)
+            return (self.env_space >= -self.ctv_half_length) & (self.env_space <= self.ctv_half_length)
         elif region == 'itv':
-            region_mask = (self.env_space >= -self.itv_extent) & (self.env_space <= self.itv_extent)
+            return (self.env_space >= -self.itv_extent) & (self.env_space <= self.itv_extent)
         else:
             raise ValueError("Region must be 'ctv' or 'itv'")
         
-        # Check for starting phase and applies mask
-        # Check for starting phase and apply mask
-        region_dose = dose_dist[region_mask] if dose_dist.ndim == 1 else dose_dist[:, region_mask]
-        
-        intended_dist = self.get_intended_dist()
-        
-        intended_dose= intended_dist[region_mask]
-        
-        # Calculate raw differences
-        diffs = region_dose - intended_dose
-        sq_diffs = diffs**2
-        
-        # Apply penalty to negative differences (underdosing) if weighting is on
-        if weighting:
-            sq_diffs[diffs < 0] *= 5
-            
-        return np.mean(sq_diffs)
+    def calc_error(self, dose_dist, weighting=True, region='itv'):
+        """Calculate the error function of the simulated dose distribution from the intended distribution"""
+        mask = self.get_region_mask(region)
+        intended = self.get_intended_dist()
+        return calc_mse(dose_dist, intended, mask, weighting)
           
-    def calculate_mask_tensor(self, period, starting_phase = None, n_phases = 24, mode = '1d', region = 'ctv'):
+    def calculate_mask_tensor(self, period, starting_phase = None, n_phases = 24, mode = '1d', region = 'itv', motion = 'sin'):
         """
         Precomputes all possible spot/time combinations.
     
@@ -442,8 +524,6 @@ class ITV_env:
                 If float: returns 3D Tensor (Spots, Time, Voxels)
                 If None: returns 4D Tensor (All Phases, Spots, Time, Voxels)
         """
-        
-        phase_speed = 2*np.pi/period # Phase of breathing
         
         if mode not in self.mode_presets:
             raise ValueError(f'Mode "{mode}" not recognised. Available: {list(self.mode_presets.keys())}')
@@ -463,15 +543,9 @@ class ITV_env:
         # Convert ticks to seconds for generation physics
         times = (np.arange(t_max_ticks + 1) * self.tick_time)[np.newaxis, :]
     
-        # Determine phase list from start_phase argument
-        if starting_phase is None:
-            # Use standard number of phases
-            phases = np.linspace(0, 2*np.pi, n_phases, endpoint=False)[:, np.newaxis]
-        else:
-            phases = np.array([starting_phase])[:, np.newaxis]
+        phases = generate_phases(n_phases, starting_phase)
             
-        # Create shift matrix
-        shifts = self.amp*np.sin((phase_speed*times) + phases)
+        shifts = generate_phase_shifts(times, phases, period, motion) # Create shift matrix
         
         # Define target region
         if region.lower() == 'ctv':
@@ -517,6 +591,22 @@ class ITV_env:
         intended_mask = self.get_intended_dist()[self.tensor_mask]
         
         return _evaluation_core(self.tensor, intended_mask, sequences, time_indices, weighting)
+    
+    def get_dvh(self, dose_dist, region='itv'):
+        """Calculates the Dose Volume Histogram (DVH) of a given dose distribution"""
+        mask = self.get_region_mask(region)
+        roi_doses = dose_dist[mask].flatten() # Get dose from required region
+            
+        sorted_doses = np.sort(roi_doses) # Sort doses
+        n_voxels = len(sorted_doses)
+        vol_pct = np.linspace(100, 0, n_voxels) # Create a volume axis
+        
+        # Prepend a 0-dose point
+        if sorted_doses[0] > 0:
+            sorted_doses = np.insert(sorted_doses, 0, 0.0)
+            vol_pct = np.insert(vol_pct, 0, 100.0)
+        
+        return sorted_doses, vol_pct
     
     def display(self, sims = None, labels = None, avg_phases = False, spot_edges = False):
         '''
@@ -568,34 +658,72 @@ class ITV_env:
         plt.tight_layout()
         plt.show()
         
+    def display_dvh(self, dose_dict, regions=None):
+        """Plots a clinical DVH"""      
+        if regions is None:
+            regions = ['ctv', 'itv']
+            
+        plt.figure(figsize=(10, 6))
+        colors = plt.cm.tab10.colors
+        line_styles = {'ctv': '-', 'itv': '--', 'body': ':'}
         
-        
-        
+        for idx, (name, dose_dist) in enumerate(dose_dict.items()):
+            # Average the phases if a multi-phase array is passed
+            if dose_dist.ndim > 1 and dose_dist.shape[0] < 100: 
+                plot_dose = np.mean(dose_dist, axis=0) 
+            else:
+                plot_dose = dose_dist
+                
+            color = colors[idx % len(colors)]
+            
+            for region in regions:
+                try:
+                    x_dose, y_vol = self.get_dvh(plot_dose, region=region)
+                    style = line_styles.get(region, '-')
+                    label = f"{name} ({region.upper()})"
+                    plt.plot(x_dose, y_vol, linestyle=style, color=color, linewidth=2, label=label)
+                except Exception as e:
+                    print(f"Skipping {region} for {name}: {e}")
 
+        # Add target line
+        rx_dose = np.max(self.get_intended_dist())
+        plt.axvline(x=rx_dose, color='black', linestyle='-.', alpha=0.5, label='Prescription Dose')
+
+        plt.title("Cumulative Dose Volume Histogram (DVH) - 1D")
+        plt.xlabel("Dose (Arbitrary Units)")
+        plt.ylabel("Volume (%)")
+        plt.ylim(0, 105)
+        plt.xlim(left=0)
+        plt.grid(True, alpha=0.3)
+        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+        plt.tight_layout()
+        plt.show()
+        
+        
+###################################################
+# CLASS FOR 2D environments
+###################################################
 class ITV_env_2D:
     '''
     Environment space for the simulation in 2D
     '''
-    def __init__(self, ctv_size, n_spots, amp, res = 0.1 , spot_size = None, t_steps = (0.1,0.1), margin = None):
+    def __init__(self, res, ctv_size, amp, n_spots = None, spot_size = None, spacing = None, t_steps = (0.1,0.1), margin = None):
         '''
         Initialises the environment, creating a high resolution coordinate space for the env of set length. Also defines positions of proton beam spots covering the ITV
         Args:
             res (float): Resolution of environment, in cm
             ctv_size (tuple, float): Dimensions of CTV in x and y, in cm
             n_spots (tuple, int): Number of proton beam spots covering the ITV in x and y dims
-            amp(float): Amplitude of breathing motion in both x and y dims, in cm
+            amp(float): Standard amplitude (half of the peak-to-peak amplitude) of breathing motion, in both x and y dims, in cm
             spot_size (float, float/None): Physical width of spot in cm
             t_steps (tuple, float): Time taken for proton beam to move to adjacent spots, in x and y dims, in s
             margin(tuple, float): Space between edge of ITV and edge of simulation in x and y dims
         '''
-        
-        if spot_size is None:
-            spot_size = tuple((np.array(ctv_size) + (2 * np.array(amp))) / np.array(n_spots))
             
         if margin is None:
             margin = amp
         
-        self.update_env(res=res, ctv_size=ctv_size, amp=amp, n_spots=n_spots, spot_size=spot_size, t_steps=t_steps, margin=margin)
+        self.update_env(res=res, ctv_size=ctv_size, amp=amp, n_spots=n_spots, spot_size=spot_size, spacing=spacing, t_steps=t_steps, margin=margin)
                 
     def update_env(self, **kwargs):
         '''
@@ -605,12 +733,48 @@ class ITV_env_2D:
         if 'res' in kwargs: self.res = kwargs['res']
         if 'ctv_size' in kwargs: self.ctv_size = kwargs['ctv_size']
         if 'amp' in kwargs: self.amp = kwargs['amp']
-        if 'n_spots' in kwargs: self.n_spots = kwargs['n_spots']
-        if 'spot_size' in kwargs: self.spot_size = kwargs['spot_size']
         if 't_steps' in kwargs: self.t_steps = kwargs['t_steps']
         if 'margin' in kwargs: self.margin = kwargs['margin']
         
-        self.n_spots_tot = self.n_spots[0] * self.n_spots[1] # Total spot number
+        spot_keys = ['n_spots', 'spot_size', 'spacing']
+        spot_args = {k: kwargs[k] for k in spot_keys if k in kwargs and kwargs[k] is not None}
+        
+        if spot_args:
+            # Spot params passed in, must be 2
+            if len(spot_args) != 2:
+                raise ValueError("When updating the grid, you must provide exactly two of: n_spots, spot_size, spacing.")
+            n_in= spot_args.get('n_spots')
+            size_in = spot_args.get('spot_size')
+            sp_in = spot_args.get('spacing')
+        else:
+            # No spot params passed in with updated env, sdefault to recalculate spacing
+            n_in = getattr(self, 'n_spots', None)
+            size_in = getattr(self, 'spot_size', None)
+            sp_in = None
+        
+        def spot_solve_axis(total_width, n, size, sp):
+            ''' Helper to solve the spot geomerty for an axis'''
+            if n is not None and size is not None and sp is None:
+                # Calculate spacing
+                if n > 1:
+                    sp = (total_width - size) / (n - 1)
+                else:
+                    sp = 0.0
+            elif size is not None and sp is not None and n is None:
+                # Calculate number of spots
+                if sp > 0:
+                    n = int(np.ceil((total_width - size) / sp)) + 1
+                    sp = (total_width - size) / (n - 1) if n > 1 else 0.0 # Adjust spacing to snap spots to ITV
+                else:
+                    n = 1
+            elif n is not None and sp is not None and size is None:
+                # Calculate spot size
+                size = total_width - (n - 1) * sp
+                if size <= 0:
+                    raise ValueError("Spacing is too large for the given number of spots.")
+            else:
+                raise ValueError("You must provide exactly two of: n_spots, spot_size, or spacing (as tuples).")
+            return n, size, sp
         
         # Unpack CTV size, amplitude and margins
         self.ctv_half_x, self.ctv_half_y = self.ctv_size[0] / 2, self.ctv_size[1] / 2
@@ -623,6 +787,20 @@ class ITV_env_2D:
         
         self.total_env_half_x = self.itv_extent_x + self.margin_x
         self.total_env_half_y = self.itv_extent_y + self.margin_y
+        
+        # Total widths of itv
+        total_width_x = 2 * self.itv_extent_x
+        total_width_y = 2 * self.itv_extent_y
+        
+        # Resolve spot geometry and save to env
+        nx, sx, spx = spot_solve_axis(total_width_x, n_in[0] if n_in else None, size_in[0] if size_in else None, sp_in[0] if sp_in else None)
+        ny, sy, spy = spot_solve_axis(total_width_y, n_in[1] if n_in else None, size_in[1] if size_in else None, sp_in[1] if sp_in else None)
+        self.n_spots = (nx, ny)
+        self.spot_size = (sx, sy)
+        self.spacing = (spx, spy)
+        self.n_spots_tot = nx * ny
+        
+        print(f"Spot Grid: {nx}x{ny} spots | Size: {sx:.2f}x{sy:.2f}cm | Spacing: {spx:.2f}x{spy:.2f}cm")
         
         # Determine environment grid size
         self.n_voxels_x = int(np.round((2 * self.total_env_half_x) / self.res))
@@ -640,8 +818,8 @@ class ITV_env_2D:
         
         # Unpack spot centres,m list and flatten into arrays
         spot_size_x, spot_size_y = self.spot_size
-        spot_axis_x = np.linspace(-self.itv_extent_x + spot_size_x/2, self.itv_extent_x - spot_size_x/2, self.n_spots[0])
-        spot_axis_y = np.linspace(-self.itv_extent_y + spot_size_y/2, self.itv_extent_y - spot_size_y/2, self.n_spots[1])
+        spot_axis_x = -self.itv_extent_x + sx/2 + (np.arange(nx) * spx)
+        spot_axis_y = -self.itv_extent_y + sy/2 + (np.arange(ny) * spy)
         SX, SY = np.meshgrid(spot_axis_x, spot_axis_y)
         self.spot_centres_x = SX.flatten()
         self.spot_centres_y = SY.flatten()
@@ -652,18 +830,8 @@ class ITV_env_2D:
         self.spot_bottom = self.spot_centres_y - spot_size_y / 2
         self.spot_top = self.spot_centres_y + spot_size_y / 2
         
-        # Calculating engine time constants
-        multiplier = 100000 # Correct for floating point errors
-        int_step_x = int(np.round(self.t_steps[0] * multiplier))
-        int_step_y = int(np.round(self.t_steps[1] * multiplier))
-        
-        # Find the greatest common divisor to get the engine tick time
-        gcd_val = math.gcd(int_step_x, int_step_y)
-        self.tick_time = gcd_val / multiplier
-        
-        # Update tick counts
-        self.t_step_ticks_x = int(np.round(self.t_steps[0] / self.tick_time))
-        self.t_step_ticks_y = int(np.round(self.t_steps[1] / self.tick_time))
+        # Set tick time and step ticks
+        self.tick_time, (self.t_step_ticks_x, self.t_step_ticks_y) = calculate_tick_constants(self.t_steps[0], self.t_steps[1])
 
         # Define empty attributes for spot weights and dose distribution
         self.spot_weights = np.zeros(self.n_spots_tot, dtype=int)
@@ -728,7 +896,7 @@ class ITV_env_2D:
                 raise ValueError(f"Unknown preset: '{sequence}'. Available: {list(presets.keys())}")  
         return sequence
 
-    def sim(self, period, sequence, starting_phase = None, n_phases = 36, weighting = True, region = 'ctv'):
+    def sim(self, period, sequence, starting_phase = None, n_phases = 24, weighting = True, region = 'itv', motion = 'sin'):
         
         '''
         Simulates spot scanning sequence in a moving target, returning the resultant dose distribution
@@ -766,17 +934,13 @@ class ITV_env_2D:
         # Convert ticks to seconds for physical calculations
         times = cumulative_ticks * self.tick_time
         
-        if starting_phase is None:
-            # Vectorize over selected phases
-            phases = np.linspace(0, 2*np.pi, n_phases, endpoint=False)[:, np.newaxis]
-        else:
-            # Simulate just the single specified phase
-            phases = np.array([starting_phase])[:, np.newaxis]
+        phases = generate_phases(n_phases, starting_phase)
+            
+        shifts = generate_phase_shifts(times, phases, period, motion)   
 
         # Resultant positional shifts in x and y
-        shifts_x = self.amp_x * np.sin((phase*times) + phases) 
-        shifts_y = self.amp_y * np.sin((phase*times) + phases)
-
+        shifts_x = self.amp_x * shifts
+        shifts_y = self.amp_y * shifts
         # Find the spot edges in sequence order and apply time spatial shifts in x and y
         left_shifts = (self.spot_left[sequence] - shifts_x)[:, :, np.newaxis]
         right_shifts = (self.spot_right[sequence] - shifts_x)[:, :, np.newaxis]
@@ -813,41 +977,24 @@ class ITV_env_2D:
         mask_y = (self.env_space_y > bottom_edges) & (self.env_space_y < top_edges)
         spot_masks = mask_x & mask_y
         
-        return spot_masks.T @ self.spot_weights # Apply required dose to each spot
+        return (spot_masks.T @ self.spot_weights).astype(np.float64) # Apply required dose to each spot
     
-    def calc_error(self, dose_dist, weighting = True, region = 'ctv'):
-        '''
-        Calculates the error of a resultant dose distribution against the intended distribution.
-        If weighting=True, applies a penalty (x5) to underdosed voxels (WMSE).
-        Otherwise, returns standard MSE.
-        '''
-        
-        # Check which region is evaluated and mask:
-        if region == 'ctv':
-            region_mask = (np.abs(self.env_space_x) <= self.ctv_half_x) & (np.abs(self.env_space_y) <= self.ctv_half_y)
-        elif region == 'itv':
-            region_mask = (np.abs(self.env_space_x) <= self.itv_extent_x) & (np.abs(self.env_space_y) <= self.itv_extent_y)
+    def get_region_mask(self, region):
+        '''Check which region is evaluated and returns mask of environment'''
+        if region == 'ctv': 
+            return (np.abs(self.env_space_x) <= self.ctv_half_x) & (np.abs(self.env_space_y) <= self.ctv_half_y)
+        elif region == 'itv': 
+            return (np.abs(self.env_space_x) <= self.itv_extent_x) & (np.abs(self.env_space_y) <= self.itv_extent_y)
         else:
             raise ValueError("Region must be 'ctv' or 'itv'")
         
-        # Check for starting phase and apply mask
-        region_dose = dose_dist[region_mask] if dose_dist.ndim == 1 else dose_dist[:, region_mask]
-        
-        # Collect intended distributed in required region
-        intended_dist = self.get_intended_dist()
-        intended_dose= intended_dist[region_mask]
-        
-        # Calculate raw differences
-        diffs = region_dose - intended_dose
-        sq_diffs = diffs**2
-        
-        # Apply penalty to negative differences (underdosing) if weighting is on
-        if weighting:
-            sq_diffs[diffs < 0] *= 5
-            
-        return np.mean(sq_diffs)
+    def calc_error(self, dose_dist, weighting=True, region='itv'):
+        """Calculate the error function of the simulated dose distribution from the intended distribution"""
+        mask = self.get_region_mask(region)
+        intended = self.get_intended_dist()
+        return calc_mse(dose_dist, intended, mask, weighting)
           
-    def calculate_mask_tensor(self, period, starting_phase = None, n_phases = 36, region = 'ctv'):
+    def calculate_mask_tensor(self, period, starting_phase = None, n_phases = 24, region = 'itv', motion = 'sin'):
         """
         Precomputes all possible spot/time combinations.
     
@@ -858,8 +1005,6 @@ class ITV_env_2D:
                 If float: returns 3D Tensor (Spots, Time, Voxels)
                 If None: returns 4D Tensor (All Phases, Spots, Time, Voxels)
         """
-        
-        phase_speed = 2*np.pi/period # Phase of breathing
         
         # Generate the row anmd column value of each required spot
         nx = self.n_spots[0]
@@ -880,16 +1025,13 @@ class ITV_env_2D:
         # Convert to secs
         times = (np.arange(t_max_ticks + 1) * self.tick_time)[np.newaxis, :]
     
-        # Determine phase list from start_phase argument
-        if starting_phase is None:
-            # Use standard number of phases
-            phases = np.linspace(0, 2*np.pi, n_phases, endpoint=False)[:, np.newaxis]
-        else:
-            phases = np.array([starting_phase])[:, np.newaxis]
+        phases = generate_phases(n_phases, starting_phase)
+            
+        shifts = generate_phase_shifts(times, phases, period, motion)
             
         # Create shift matrices
-        shifts_x = self.amp_x * np.sin((phase_speed * times) + phases)
-        shifts_y = self.amp_y * np.sin((phase_speed * times) + phases)
+        shifts_x = self.amp_x * shifts
+        shifts_y = self.amp_y * shifts
 
         # Define target region
         if region.lower() == 'ctv':
@@ -942,7 +1084,23 @@ class ITV_env_2D:
         
         intended_mask = self.get_intended_dist()[self.tensor_mask]
         
-        return _evaluation_core(self.tensor, intended_mask, sequences, time_indices, weighting) 
+        return _evaluation_core(self.tensor, intended_mask, sequences, time_indices, weighting)
+    
+    def get_dvh(self, dose_dist, region='itv'):
+        """Calculates the Dose Volume Histogram (DVH) of a given dose distribution"""
+        mask = self.get_region_mask(region)
+        roi_doses = dose_dist[mask].flatten() # Get dose from required region
+            
+        sorted_doses = np.sort(roi_doses) # Sort doses
+        n_voxels = len(sorted_doses)
+        vol_pct = np.linspace(100, 0, n_voxels) # Create a volume axis
+        
+        # Prepend a 0-dose point
+        if sorted_doses[0] > 0:
+            sorted_doses = np.insert(sorted_doses, 0, 0.0)
+            vol_pct = np.insert(vol_pct, 0, 100.0)
+        
+        return sorted_doses, vol_pct
     
     def display(self, doses_dict):
         '''
@@ -990,5 +1148,46 @@ class ITV_env_2D:
             else:
                 ax.axis('off')
 
+        plt.tight_layout()
+        plt.show()
+        
+    def display_dvh(self, dose_dict, regions=None):
+        """Plots a clinical DVH"""      
+        if regions is None:
+            regions = ['ctv', 'itv']
+            
+        plt.figure(figsize=(10, 6))
+        colors = plt.cm.tab10.colors
+        line_styles = {'ctv': '-', 'itv': '--', 'body': ':'}
+        
+        for idx, (name, dose_dist) in enumerate(dose_dict.items()):
+            # Average the phases if a multi-phase array is passed
+            if dose_dist.ndim > 1 and dose_dist.shape[0] < 100: 
+                plot_dose = np.mean(dose_dist, axis=0) 
+            else:
+                plot_dose = dose_dist
+                
+            color = colors[idx % len(colors)]
+            
+            for region in regions:
+                try:
+                    x_dose, y_vol = self.get_dvh(plot_dose, region=region)
+                    style = line_styles.get(region, '-')
+                    label = f"{name} ({region.upper()})"
+                    plt.plot(x_dose, y_vol, linestyle=style, color=color, linewidth=2, label=label)
+                except Exception as e:
+                    print(f"Skipping {region} for {name}: {e}")
+
+        # Add target line
+        rx_dose = np.max(self.get_intended_dist())
+        plt.axvline(x=rx_dose, color='black', linestyle='-.', alpha=0.5, label='Prescription Dose')
+
+        plt.title("Cumulative Dose Volume Histogram (DVH) - 1D")
+        plt.xlabel("Dose (Arbitrary Units)")
+        plt.ylabel("Volume (%)")
+        plt.ylim(0, 105)
+        plt.xlim(left=0)
+        plt.grid(True, alpha=0.3)
+        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5))
         plt.tight_layout()
         plt.show()
