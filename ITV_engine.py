@@ -66,8 +66,68 @@ def _build_tensor_2d(shifts_x, shifts_y, spot_l, spot_r, spot_b, spot_t, env_x, 
     
     return tensor
 
+@njit(cache=True)
+def _calculate_hi(phase_dose, ctv_indices, max_expected_dose=5.0, n_bins=1000):
+    """
+    Calculates D2, D98 and D50 for the homogeneity index
+    """
+    # Pre-allocate histogram
+    hist = np.zeros(n_bins, dtype=np.int32)
+    bin_width = max_expected_dose / n_bins
+    
+    n_ctv_voxels = len(ctv_indices)
+    
+    # Tally voxels into bins
+    for i in range(n_ctv_voxels):
+        v = ctv_indices[i]
+        d = phase_dose[v]
+        
+        bin_idx = int(d / bin_width)
+        
+        # Clamp to prevent out of bounds errors
+        if bin_idx >= n_bins:
+            bin_idx = n_bins - 1
+        elif bin_idx < 0:
+            bin_idx = 0
+            
+        hist[bin_idx] += 1
+        
+    # Safety check
+    if n_ctv_voxels == 0: return 0.0
+        
+    #  Calculate the voxel thresholds for 2%, 50% and 98% of the volume
+    v_2 = int(n_ctv_voxels * 0.02)
+    v_98 = int(n_ctv_voxels * 0.98)
+    v_50 = int(n_ctv_voxels * 0.5)
+    
+    # Find D2 (Start from the hottest bin and count down)
+    cumulative_voxels = 0
+    d2_val = max_expected_dose
+    for b in range(n_bins - 1, -1, -1):
+        cumulative_voxels += hist[b]
+        if cumulative_voxels >= v_2:
+            d2_val = b * bin_width
+            break
+    
+    # Find D50
+    for b in range(b, -1, -1): # Continue counting down
+        cumulative_voxels += hist[b]
+        if cumulative_voxels >= v_50:
+            d50_val = b * bin_width
+            break
+            
+    # Find D98
+    for b in range(b, -1, -1): # Continue counting down
+        cumulative_voxels += hist[b]
+        if cumulative_voxels >= v_98:
+            d98_val = b * bin_width
+            break
+            
+    # Return the Homogeneity Index
+    return (d2_val - d98_val) / d50_val
+
 @njit(cache = True)
-def _evaluation_core_single_thread(tensor, intended, seq, time_indices, weighting):
+def _evaluation_core_single_thread(tensor, intended, ctv_indices, seq, time_indices, weighting, w_mse, w_hi, w_pmax, w_vmax):
     
     n_phases = tensor.shape[0]
     n_voxels = len(intended)
@@ -75,6 +135,10 @@ def _evaluation_core_single_thread(tensor, intended, seq, time_indices, weightin
     seq_len = seq.shape[0]
     
     total_sq_diff = 0.0
+    worst_voxel_mse = 0.0
+    worst_phase_mse = 0.0
+    total_hi = 0.0
+    
     phase_dose = np.zeros(n_voxels)
     
     for p in range(n_phases):
@@ -95,15 +159,46 @@ def _evaluation_core_single_thread(tensor, intended, seq, time_indices, weightin
                 
                 phase_dose[v_idx] += 1.0
                 
+        phase_sq_diff = 0.0
+                
         # Calculate Error
         for v in range(n_voxels):
             diff = phase_dose[v] - intended[v]
             sq_diff = diff * diff
+            
+            # Apply penalty only if it's a cold spot
             if weighting and diff < 0:
                 sq_diff *= 5.0
-            total_sq_diff += sq_diff
+                abs_err = abs(diff) * 5.0
+            else:
+                abs_err = abs(diff)
+                
+            phase_sq_diff += sq_diff
             
-    return total_sq_diff / (n_phases * n_voxels) # Return the average MSE
+            # Track global worst voxel error
+            if abs_err > worst_voxel_mse:
+                worst_voxel_mse = abs_err
+            
+            global_max_error = max(global_max_error, abs_err)
+                
+        phase_mse = phase_sq_diff / n_voxels
+        
+        # Tracking the worst phase
+        if phase_mse > worst_phase_mse:
+            worst_phase_mse = phase_mse
+            
+        # Add to the tracker for the Average MSE
+        total_sq_diff += phase_sq_diff
+        
+        # Calculate homogeneity index for this phase
+        dynamic_max = np.max(intended) * 3.0    
+        phase_hi = _calculate_hi(phase_dose, ctv_indices, max_expected_dose=dynamic_max, n_bins=1000)
+        total_hi += phase_hi
+        
+    avg_mse = total_sq_diff / (n_phases * n_voxels) # Average MSE
+    avg_hi = total_hi / n_phases
+            
+    return (w_mse * avg_mse) + (w_hi * avg_hi) + (w_pmax * worst_phase_mse) + (w_vmax * worst_voxel_mse)
 
 @njit(parallel=True, cache=True)
 def _evaluation_core(tensor, intended, sequences, time_indices, weighting):
@@ -487,7 +582,7 @@ class ITV_env_1D:
 
         return dose_dist, error   
 
-    def get_intended_dist(self):
+    def get_nominal_dist(self):
         '''
         Deliver the intended distribution to env
         '''
@@ -495,8 +590,13 @@ class ITV_env_1D:
         right_edges = self.spot_right_edges[:, np.newaxis]
     
         spot_masks = (self.env_space > left_edges) & (self.env_space < right_edges)
+        planned_dose = (spot_masks.T @ self.spot_weights).astype(np.float64)
         
-        return (spot_masks.T @ self.spot_weights).astype(np.float64)
+        intended = np.zeros(self.n_env_voxels, dtype=np.float64)
+        ctv_mask = self.get_region_mask('ctv')
+        intended[ctv_mask] = planned_dose[ctv_mask]
+        
+        return intended
     
     def get_region_mask(self, region):
         '''Check which region is evaluated and returns mask of environment'''
@@ -510,7 +610,7 @@ class ITV_env_1D:
     def calc_error(self, dose_dist, weighting=True, region='itv'):
         """Calculate the error function of the simulated dose distribution from the intended distribution"""
         mask = self.get_region_mask(region)
-        intended = self.get_intended_dist()
+        intended = self.get_nominal_dist()
         return calc_mse(dose_dist, intended, mask, weighting)
           
     def calculate_mask_tensor(self, period, starting_phase = None, n_phases = 24, mode = '1d', region = 'itv', motion = 'sin'):
@@ -588,7 +688,7 @@ class ITV_env_1D:
         time_indices = np.zeros(sequences.shape, dtype=int)
         time_indices[:, 1:] = np.cumsum(ticks, axis=1)
         
-        intended_mask = self.get_intended_dist()[self.tensor_mask]
+        intended_mask = self.get_nominal_dist()[self.tensor_mask]
         
         return _evaluation_core(self.tensor, intended_mask, sequences, time_indices, weighting)
     
@@ -613,7 +713,7 @@ class ITV_env_1D:
         Generate and display the intended target distribution, along with other simulated distributions
         '''
         
-        target_dist = self.get_intended_dist()
+        target_dist = self.get_nominal_dist()
         
         ctv_intended = np.zeros_like(self.env_space)
         ctv_mask = (self.env_space >= -self.ctv_half_length) & (self.env_space <= self.ctv_half_length)
@@ -686,7 +786,7 @@ class ITV_env_1D:
                     print(f"Skipping {region} for {name}: {e}")
 
         # Add target line
-        rx_dose = np.max(self.get_intended_dist())
+        rx_dose = np.max(self.get_nominal_dist())
         plt.axvline(x=rx_dose, color='black', linestyle='-.', alpha=0.5, label='Prescription Dose')
 
         plt.title("Cumulative Dose Volume Histogram (DVH) - 1D")
@@ -908,8 +1008,6 @@ class ITV_env_2D:
         
         sequence = self.set_sequence(sequence)
         
-        phase = 2*np.pi/period # Phase of breathing
-        
         nx = self.n_spots[0] # Number of columns in spot grid
         
         # Decode spot sequence into row and columns
@@ -957,11 +1055,11 @@ class ITV_env_2D:
         
         dose_dist = dose_dist if starting_phase is None else dose_dist[0] # Array fix for a starting phase
         
-        error = self.calc_error(dose_dist, weighting = weighting, region = region) # Calculate the error function of sim
+        error_metrics = self.calc_error_metrics(dose_dist, weighting = weighting, region = region) # Calculate the error function of sim
 
-        return dose_dist, error   
+        return dose_dist, error_metrics 
 
-    def get_intended_dist(self):
+    def get_nominal_dist(self):
         '''
         Deliver the intended distribution to env
         '''
@@ -977,7 +1075,50 @@ class ITV_env_2D:
         mask_y = (self.env_space_y > bottom_edges) & (self.env_space_y < top_edges)
         spot_masks = mask_x & mask_y
         
-        return (spot_masks.T @ self.spot_weights).astype(np.float64) # Apply required dose to each spot
+        planned_dose = (spot_masks.T @ self.spot_weights).astype(np.float64)
+        
+        intended = np.zeros(self.n_env_voxels, dtype=np.float64)
+        ctv_mask = self.get_region_mask('itv')
+        
+        intended[ctv_mask] = planned_dose[ctv_mask]
+        
+        return intended
+    
+    def get_4d_composite(self, n_phases = 24, motion='sin'):
+        '''
+        Calculates the 4D-Composite dose for also phase distributions free of interplay.
+        Represents a perfectly motion-blurred distribution
+        '''
+        # Time is 0 for all spots
+        times = np.array([[0.0]]) 
+        phases = generate_phases(n_phases, None)
+        # Generating shifts with only starting phases as arguments
+        shifts = generate_phase_shifts(times, phases, 1.0, motion) 
+        
+        shifts_x = self.amp_x * shifts
+        shifts_y = self.amp_y * shifts
+        
+        composite_dose = np.zeros(self.n_env_voxels, dtype=np.float64)
+        
+        for p in range(n_phases):
+            # Shift the spot edges for this specific phase
+            left_edges = (self.spot_left - shifts_x[p, 0])[:, np.newaxis]
+            right_edges = (self.spot_right - shifts_x[p, 0])[:, np.newaxis]
+            bottom_edges = (self.spot_bottom - shifts_y[p, 0])[:, np.newaxis]
+            top_edges = (self.spot_top - shifts_y[p, 0])[:, np.newaxis]
+
+            # Generate spot regions using masks for this phase
+            mask_x = (self.env_space_x > left_edges) & (self.env_space_x < right_edges)
+            mask_y = (self.env_space_y > bottom_edges) & (self.env_space_y < top_edges)
+            spot_masks = mask_x & mask_y
+            
+            # Calculate what the dose would be for this phase
+            phase_dose = (spot_masks.T @ self.spot_weights).astype(np.float64)
+            composite_dose += phase_dose
+            
+        # The 4D Composite is the average of all phases
+        return composite_dose / n_phases
+        
     
     def get_region_mask(self, region):
         '''Check which region is evaluated and returns mask of environment'''
@@ -988,11 +1129,89 @@ class ITV_env_2D:
         else:
             raise ValueError("Region must be 'ctv' or 'itv'")
         
-    def calc_error(self, dose_dist, weighting=True, region='itv'):
-        """Calculate the error function of the simulated dose distribution from the intended distribution"""
-        mask = self.get_region_mask(region)
-        intended = self.get_intended_dist()
-        return calc_mse(dose_dist, intended, mask, weighting)
+    def calc_error_metrics(self, dose_dist, weighting=True, region='itv', motion='sin'):
+        """Calculate MSE, maximum error, Homogeneity Index, and WOrst Phase MSE"""
+        
+        if dose_dist.ndim == 1:
+            dose_dist = dose_dist[np.newaxis, :]
+            
+        n_phases = dose_dist.shape[0]
+        
+        # 2. Get Targets and Masks
+        target_dose = self.get_4d_composite(motion=motion)
+        mask_eval = self.get_region_mask(region) # Usually the ITV
+        mask_ctv = self.get_region_mask('ctv')   # Strict CTV
+        
+        target_eval = target_dose[mask_eval]
+        
+        # Initialise metrics
+        total_mse = 0.0
+        worst_phase_mse = 0.0
+        global_max_err = 0.0
+        total_hi = 0.0
+        
+        # Evaluate by phase
+        for p in range(n_phases):
+            # Slice out the specific regions for this phase
+            phase_eval = dose_dist[p][mask_eval]
+            phase_ctv = dose_dist[p][mask_ctv]
+            
+            # MSE and worst-voxels errors
+            diff = phase_eval - target_eval
+            # Apply weighting the MSE
+            weights = np.ones_like(diff)
+            if weighting:
+                weights[diff < 0] = 5.0
+                
+            # Track Phase MSE
+            sq_diff = (diff ** 2) * weights
+            phase_mse = np.mean(sq_diff)
+            total_mse += phase_mse
+            
+            # Track the worst phase
+            if phase_mse > worst_phase_mse:
+                worst_phase_mse = phase_mse
+            
+            # Track maximum voxel error
+            phase_max = np.max(np.abs(diff) * weights)
+            if phase_max > global_max_err:
+                global_max_err = phase_max
+                
+            # Homogeneity Index
+            # D2: Hottest 2% of volume
+            # D98: Coldest 2% of volume
+            # D50: Average
+            if len(phase_ctv) > 0:
+                d2 = np.percentile(phase_ctv, 98)
+                d50 = np.percentile(phase_ctv, 50)
+                d98 = np.percentile(phase_ctv, 2)
+                
+                # HI calculation
+                if d50 > 0.001: # Safety check
+                    phase_hi = (d2 - d98) / d50
+                else:
+                    phase_hi = 1.0 # Heavy penalty if the tumor gets no dose
+            else:
+                phase_hi = 1.0 
+                
+            total_hi += phase_hi
+
+        # Average the metrics
+        avg_mse = total_mse / n_phases
+        avg_hi = total_hi / n_phases
+        
+        # Build scorecard
+        metrics = {
+            'MSE (Average)': avg_mse,
+            'HI (Average)': avg_hi,
+            'Worst Voxel Error': global_max_err
+        }
+        
+        # Add Multi-Phase specific metrics
+        if n_phases > 1:
+            metrics['Worst Phase MSE'] = worst_phase_mse
+            
+        return metrics
           
     def calculate_mask_tensor(self, period, starting_phase = None, n_phases = 24, region = 'itv', motion = 'sin'):
         """
@@ -1006,7 +1225,9 @@ class ITV_env_2D:
                 If None: returns 4D Tensor (All Phases, Spots, Time, Voxels)
         """
         
-        # Generate the row anmd column value of each required spot
+        self.tensor_motion = motion
+        
+        # Generate the row and column value of each required spot
         nx = self.n_spots[0]
         cols = self.spots_expanded % nx
         rows = self.spots_expanded // nx
@@ -1082,7 +1303,7 @@ class ITV_env_2D:
         time_indices = np.zeros(sequences.shape, dtype=int)
         time_indices[:, 1:] = np.cumsum(ticks, axis=1)
         
-        intended_mask = self.get_intended_dist()[self.tensor_mask]
+        intended_mask = self.get_4d_composite(motion=self.tensor_motion)[self.tensor_mask]
         
         return _evaluation_core(self.tensor, intended_mask, sequences, time_indices, weighting)
     
@@ -1109,12 +1330,13 @@ class ITV_env_2D:
             doses_dict (dict): A dictionary where keys are titles (strings) 
                                and values are the dose arrays (1D flat).
         '''
-        # Always include the intended distribution as the first plot
-        intended_2d = self.get_intended_dist().reshape(self.n_voxels_y, self.n_voxels_x)
+        # Include Nominal and Composite distributions
+        intended_2d = self.get_nominal_dist().reshape(self.n_voxels_y, self.n_voxels_x)
+        composite = self.get_4d_composite(motion=self.tensor_motion).reshape(self.n_voxels_y, self.n_voxels_x)
         
         # Prepare titles and 2D arrays
-        titles = ["Intended (ITV)"] + list(doses_dict.keys())
-        all_doses = [intended_2d]
+        titles = ["Nominal Distribution", "4D Composite Distribution"] + list(doses_dict.keys())
+        all_doses = [intended_2d, composite]
         for d in doses_dict.values():
             # If d has 2 dimensions (Phases, Voxels), take the mean across phases
             if d.ndim == 2:
@@ -1123,7 +1345,7 @@ class ITV_env_2D:
                 d_to_plot = d
                 
             all_doses.append(d_to_plot.reshape(self.n_voxels_y, self.n_voxels_x))
-        
+
         # Find the global max dose to standardise the color scale
         global_vmax = max([d.max() for d in all_doses])
         global_vmin = 0
@@ -1134,7 +1356,7 @@ class ITV_env_2D:
         
         fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 5*rows), squeeze=False)
         extent = [-self.total_env_half_x, self.total_env_half_x, -self.total_env_half_y, self.total_env_half_y]
-
+        
         for i, ax in enumerate(axes.flat):
             if i < n_plots:
                 im = ax.imshow(all_doses[i], extent=extent, origin='lower', 
@@ -1177,9 +1399,9 @@ class ITV_env_2D:
                     plt.plot(x_dose, y_vol, linestyle=style, color=color, linewidth=2, label=label)
                 except Exception as e:
                     print(f"Skipping {region} for {name}: {e}")
-
+                    
         # Add target line
-        rx_dose = np.max(self.get_intended_dist())
+        rx_dose = np.max(self.get_nominal_dist())
         plt.axvline(x=rx_dose, color='black', linestyle='-.', alpha=0.5, label='Prescription Dose')
 
         plt.title("Cumulative Dose Volume Histogram (DVH) - 1D")

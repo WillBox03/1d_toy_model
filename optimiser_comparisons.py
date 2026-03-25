@@ -193,7 +193,7 @@ def optimiser_analysis(ctv_length, amp, period, t_step=0.1, n_spots=10, repaints
     opt_dose, _ = env.sim(period, global_best_seq, starting_phase)
     opt_avg_dose = np.mean(opt_dose, axis = 0) if opt_dose.ndim > 1 else opt_dose
     
-    intended_dose = env.get_intended_dist()
+    intended_dose = env.get_nominal_dist()
     
     # Create Plots
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
