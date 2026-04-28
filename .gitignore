@@ -15,6 +15,15 @@ parameter_analysis.py
 sim_anneal_optimise.py
 hybrid_raster_compare.py
 plot_greedy.py
+comparison_tests.py
+final_test.py
+motion_gated.py
+showcase.py
+tcp.py
 
 # Folders
 benchmarks
+
+#Images
+Gated_Delivery_Simulation.png
+TCP_NTCP_Curve.png

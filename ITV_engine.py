@@ -122,6 +122,9 @@ def _calculate_hi(phase_dose, ctv_indices, max_expected_dose=5.0, n_bins=1000):
         if cumulative_voxels >= v_98:
             d98_val = b * bin_width
             break
+        
+    if d50_val <= 0.001:
+        return 10.0 # Return a massive penalty if the tumor has no dose
             
     # Return the Homogeneity Index
     return (d2_val - d98_val) / d50_val
@@ -176,10 +179,7 @@ def _evaluation_core_single_thread(tensor, intended, ctv_indices, seq, time_indi
             phase_sq_diff += sq_diff
             
             # Track global worst voxel error
-            if abs_err > worst_voxel_mse:
-                worst_voxel_mse = abs_err
-            
-            global_max_error = max(global_max_error, abs_err)
+            worst_voxel_mse= max(worst_voxel_mse, abs_err)
                 
         phase_mse = phase_sq_diff / n_voxels
         
@@ -1346,9 +1346,14 @@ class ITV_env_2D:
                 
             all_doses.append(d_to_plot.reshape(self.n_voxels_y, self.n_voxels_x))
 
-        # Find the global max dose to standardise the color scale
-        global_vmax = max([d.max() for d in all_doses])
+        # 1. Find the exact prescription (intended) dose
+        rx_dose = np.max(intended_2d)
+        
+        # 2. Lock the color scale so the prescribed dose is ALWAYS the standard red.
+        # We multiply by 1.1 so that 100% Rx is bright red, and any dangerous overdoses 
+        # (hot spots) push into the absolute darkest red/brown at the top of the 'jet' colormap.
         global_vmin = 0
+        global_vmax = rx_dose * 1.2
 
         n_plots = len(all_doses)
         cols = min(n_plots, 3)
