@@ -7,14 +7,14 @@ from optimiser import SequenceOptimiser
 import numpy as np
 import matplotlib.pyplot as plt
 
-def plot_metrics_barchart(raster_metrics, sa_metrics, hi_scale=10):
+def plot_metrics_barchart(raster_metrics, sa_metrics):
     """
     Plots a grouped bar chart comparing all 4 key metrics on a single axis.
     Visually boosts the HI bar height while displaying the true numeric score.
     """
-    keys = ['MSE (Average)', 'Worst Phase MSE', 'Worst Voxel Error', 'HI (Average)']
+    keys = ['MSE (Average)', 'Worst Phase MSE', 'HI (Average)']
     # Note the (x10) tag so the judges understand the axis scale
-    labels = ['Average MSE', 'Worst Phase MSE', 'Worst Voxel Error', f'Average HI (x{hi_scale})']
+    labels = ['Average MSE', 'Worst Phase MSE', 'Average HI']
     
     # 1. Extract the TRUE values
     raster_true = [raster_metrics.get(k, 0) for k in keys]
@@ -23,10 +23,7 @@ def plot_metrics_barchart(raster_metrics, sa_metrics, hi_scale=10):
     # 2. Create SCALED values for drawing the physical bar heights
     raster_scaled = raster_true.copy()
     sa_scaled = sa_true.copy()
-    
-    raster_scaled[3] *= hi_scale  # Boost Raster HI
-    sa_scaled[3] *= hi_scale      # Boost SA HI
-    
+
     x = np.arange(len(labels))
     width = 0.35
 
@@ -34,7 +31,7 @@ def plot_metrics_barchart(raster_metrics, sa_metrics, hi_scale=10):
     
     # Draw bars using the SCALED heights
     rects1 = ax.bar(x - width/2, raster_scaled, width, label='Raster Scan', color='#ff6b6b', edgecolor='black')
-    rects2 = ax.bar(x + width/2, sa_scaled, width, label='Optimized (SA)', color='#4ecdc4', edgecolor='black')
+    rects2 = ax.bar(x + width/2, sa_scaled, width, label='Optimised (SA)', color='#4ecdc4', edgecolor='black')
 
     ax.set_ylabel('Metric Score', fontsize=12, fontweight='bold')
     ax.set_title('Sequence Evaluation: Raster vs. Simulated Annealing', fontsize=16, fontweight='bold')
@@ -57,21 +54,21 @@ def plot_metrics_barchart(raster_metrics, sa_metrics, hi_scale=10):
 
 def run_comparison_test():
     # Setup Parameters
-    ctv_size = (1.0, 1.0)
-    n_spots = (5,10)
-    spot_size = (0.2, 0.2)
-    amp = (0, 0.5)      
+    ctv_size = (2.0, 2.0)
+    n_spots = (5, 10)
+    spot_size = (0.4, 0.4)
+    amp = (0, 1)      
     res = 0.05   # Lowered for faster optimiser calculation
     t_steps = (0.05, 0.05)
     period = 5.0
-    margin = (0.5, 0.5)
+    margin = (0.5, 2)
     weighting = True
-    starting_phase = 0
-    repaints = 0
+    starting_phase = None
+    repaints = 9
     region = 'itv'
     motion = 'sin6'
-    eval_weightings = [2,10,2, 1]
-    n_phases = 24
+    eval_weightings = [1000, 1000 +(10* repaints),2,0]
+    n_phases = 10
 
     # Initialize Engine
     print("Initializing Simulation Environment...")
@@ -85,15 +82,15 @@ def run_comparison_test():
     _, raster_metrics = env.sim(period=period, sequence=raster_seq, starting_phase=starting_phase, 
                                 weighting=weighting, region=region, motion=motion)
 
-    # --- 3. Optimized Sequence (Simulated Annealing) ---
+    # --- 3. Optimised Sequence (Simulated Annealing) ---
     print("Precomputing Tensor for Optimization...")
     env.calculate_mask_tensor(period=period, starting_phase=starting_phase, region=region, motion=motion)
     opt = SequenceOptimiser(env)
 
-    best_sa_seq, _, _ = opt.simulated_annealing(iterations=500000, pop_size=32, weighting=weighting, 
+    best_sa_seq, _, _ = opt.simulated_annealing(iterations=50000, pop_size=24, weighting=weighting, 
                                                 seed_sequence=None, eval_weightings=eval_weightings)
     
-    print("Simulating Optimized Sequence Composite...")
+    print("Simulating Optimised Sequence Composite...")
     _, sa_metrics = env.sim(period=period, sequence=best_sa_seq, starting_phase=starting_phase, 
                             weighting=weighting, region=region, motion=motion)
 

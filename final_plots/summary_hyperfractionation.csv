@@ -1,0 +1,5 @@
+Regime,Repaints,MSE (Average) Raster,MSE (Average) SA,MSE (Average) Impr (%),Worst Voxel Error (CTV Average) Raster,Worst Voxel Error (CTV Average) SA,Worst Voxel Error (CTV Average) Impr (%),HI (Average) Raster,HI (Average) SA,HI (Average) Impr (%)
+Hyperfractionation,0,34.9392,25.0217,28.38,53.0162,42.2364,20.33,0.8483,0.6794,19.92
+Hyperfractionation,3,14.6249,12.9577,11.4,21.8146,22.3773,-2.58,0.4809,0.4678,2.73
+Hyperfractionation,9,9.3996,9.8741,-5.05,13.7378,16.8717,-22.81,0.3814,0.4004,-4.97
+Hyperfractionation,19,7.4167,8.7551,-18.04,11.2461,14.5216,-29.13,0.3309,0.362,-9.38

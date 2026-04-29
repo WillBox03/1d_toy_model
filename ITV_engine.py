@@ -141,8 +141,15 @@ def _evaluation_core_single_thread(tensor, intended, ctv_indices, seq, time_indi
     worst_voxel_mse = 0.0
     worst_phase_mse = 0.0
     total_hi = 0.0
+    norm_fact = 0.0
     
     phase_dose = np.zeros(n_voxels)
+    
+    # Adds normalisation factor to keep scale of the MSE comparable for different envs
+    for v in range(n_voxels):
+        norm_fact += intended[v] * intended[v]
+    if norm_fact == 0.0:
+        norm_fact = 1e-10 # Prevent divide-by-zero
     
     for p in range(n_phases):
         # Zero out the dose array
@@ -181,7 +188,7 @@ def _evaluation_core_single_thread(tensor, intended, ctv_indices, seq, time_indi
             # Track global worst voxel error
             worst_voxel_mse= max(worst_voxel_mse, abs_err)
                 
-        phase_mse = phase_sq_diff / n_voxels
+        phase_mse = phase_sq_diff / norm_fact # Average phase MSE
         
         # Tracking the worst phase
         if phase_mse > worst_phase_mse:
@@ -215,6 +222,12 @@ def _evaluation_core(tensor, intended, sequences, time_indices, weighting):
     avg_dists = np.zeros((n_sequences, n_voxels))
     worst_dists = np.zeros((n_sequences, n_voxels))
     std_mses = np.zeros(n_sequences)
+    
+    norm_fact = 0.0
+    for v in range(n_voxels):
+        norm_fact += intended[v] * intended[v]
+    if norm_fact == 0.0:
+        norm_fact = 1e-10 # Prevent divide-by-zero
     
     for i in prange(n_sequences):
         seq_sum_mse = 0.0
@@ -256,7 +269,7 @@ def _evaluation_core(tensor, intended, sequences, time_indices, weighting):
                 # Accumulate the dose for the average distribution calculation
                 seq_avg_dose[v] += phase_dose[v]
                 
-            phase_mse = phase_sq_diff / n_voxels # Average phase MSE
+            phase_mse = phase_sq_diff / norm_fact # Average phase MSE
             seq_sum_mse += phase_mse
             seq_sum_sq_mse += (phase_mse * phase_mse) # Square MSE, add to total for std
             
@@ -268,7 +281,7 @@ def _evaluation_core(tensor, intended, sequences, time_indices, weighting):
                     seq_worst_dose[v] = phase_dose[v]
                     
         # Finalize the sequence and calculate standard deviation
-        avg_mse = seq_sum_mse / n_phases
+        avg_mse = seq_sum_mse / norm_fact
         avg_mses[i] = avg_mse
         worst_mses[i] = seq_worst_mse
         var = (seq_sum_sq_mse / n_phases) - (avg_mse * avg_mse)
@@ -303,7 +316,7 @@ def generate_phase_shifts(times, phases, period, motion):
         return np.sin((phase_speed * times) + phases)
     elif motion == 'sin6':
         phase_speed = np.pi / period
-        return (2.0 * (np.sin((phase_speed * times) + phases) ** 6)) - 1.0
+        return (2.0 * (np.sin((phase_speed * times) + phases) ** 6))
     else:
         raise ValueError(f"Unknown motion model: '{motion}'. Use 'sin' or 'sin6'.")
     
@@ -1129,26 +1142,34 @@ class ITV_env_2D:
         else:
             raise ValueError("Region must be 'ctv' or 'itv'")
         
-    def calc_error_metrics(self, dose_dist, weighting=True, region='itv', motion='sin'):
-        """Calculate MSE, maximum error, Homogeneity Index, and WOrst Phase MSE"""
+    def calc_error_metrics(self, dose_dist, weighting=True, region='itv', motion='sin6'):
+        """Calculate MSE, maximum error, Homogeneity Index, and Worst Phase MSE"""
         
         if dose_dist.ndim == 1:
             dose_dist = dose_dist[np.newaxis, :]
             
         n_phases = dose_dist.shape[0]
         
-        # 2. Get Targets and Masks
+        # Get Targets and Masks
         target_dose = self.get_4d_composite(motion=motion)
         mask_eval = self.get_region_mask(region) # Usually the ITV
         mask_ctv = self.get_region_mask('ctv')   # Strict CTV
         
         target_eval = target_dose[mask_eval]
+        target_ctv = target_dose[mask_ctv]
         
         # Initialise metrics
         total_mse = 0.0
         worst_phase_mse = 0.0
         global_max_err = 0.0
         total_hi = 0.0
+        total_ctv_max_err = 0.0
+        
+        # Calculate normalisation factor
+        norm_fact = np.sum(target_eval ** 2) + 1e-10
+        max_intended = np.max(target_eval)
+        if max_intended == 0.0:
+            max_intended = 1e-10
         
         # Evaluate by phase
         for p in range(n_phases):
@@ -1165,23 +1186,38 @@ class ITV_env_2D:
                 
             # Track Phase MSE
             sq_diff = (diff ** 2) * weights
-            phase_mse = np.mean(sq_diff)
+            phase_mse = np.sum(sq_diff) / norm_fact
             total_mse += phase_mse
             
             # Track the worst phase
             if phase_mse > worst_phase_mse:
                 worst_phase_mse = phase_mse
-            
-            # Track maximum voxel error
-            phase_max = np.max(np.abs(diff) * weights)
-            if phase_max > global_max_err:
-                global_max_err = phase_max
                 
             # Homogeneity Index
             # D2: Hottest 2% of volume
             # D98: Coldest 2% of volume
             # D50: Average
             if len(phase_ctv) > 0:
+                # 1. Raw absolute difference
+                diff_ctv = phase_ctv - target_ctv
+                
+                # 2. Voxel-by-voxel RELATIVE dose error
+                # We use np.where to prevent dividing by zero. 
+                # If intended dose is tiny (< 0.001), we scale relative to the max_intended instead.
+                safe_target_ctv = np.where(target_ctv > 0.001, target_ctv, max_intended)
+                rel_dose_err_array = np.abs(diff_ctv) / safe_target_ctv
+                
+                # 3. Find the maximum relative error in the CTV for this phase
+                phase_max_ctv = np.max(rel_dose_err_array)
+                
+                # Add it to our running total to average later
+                total_ctv_max_err += phase_max_ctv
+                
+                # (Optional) Track the global worst across the whole evaluation region
+                phase_max_global = np.max(np.abs(diff) * weights) / max_intended
+                if phase_max_global > global_max_err:
+                    global_max_err = phase_max_global
+                
                 d2 = np.percentile(phase_ctv, 98)
                 d50 = np.percentile(phase_ctv, 50)
                 d98 = np.percentile(phase_ctv, 2)
@@ -1199,12 +1235,14 @@ class ITV_env_2D:
         # Average the metrics
         avg_mse = total_mse / n_phases
         avg_hi = total_hi / n_phases
+        avg_ctv_max_err = total_ctv_max_err / n_phases
         
         # Build scorecard
         metrics = {
             'MSE (Average)': avg_mse,
             'HI (Average)': avg_hi,
-            'Worst Voxel Error': global_max_err
+            'Worst Voxel Error': global_max_err,
+            'Worst Voxel Error (CTV Average)': avg_ctv_max_err
         }
         
         # Add Multi-Phase specific metrics
